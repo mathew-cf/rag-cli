@@ -68,9 +68,12 @@ jobs:
           sed -i "0,/^version = \".*\"/s//version = \"${new}\"/" Cargo.toml
           echo "version=${new}" >> "$GITHUB_OUTPUT"
 
+      - name: Update lockfile
+        run: cargo update --workspace
+
       - name: Commit and tag
         run: |
-          git add Cargo.toml
+          git add Cargo.toml Cargo.lock
           git commit -m "chore: release v${{ steps.version.outputs.version }}"
           git tag "v${{ steps.version.outputs.version }}"
           git push --follow-tags
