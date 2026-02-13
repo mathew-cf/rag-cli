@@ -21,7 +21,10 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Build
@@ -38,6 +41,8 @@ jobs:
     permissions:
       id-token: write # Required for trusted publishing OIDC token
       contents: write # Push version bump commit and tag
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -78,3 +83,40 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release-binaries:
+    name: Release binaries
+    needs: publish
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: rag-cli-linux-x86_64
+          - os: macos-latest
+            artifact: rag-cli-macos-aarch64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main # Get the version-bumped commit from publish job
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/rag-cli dist/${{ matrix.artifact }}
+          chmod +x dist/${{ matrix.artifact }}
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.publish.outputs.version }}
+          files: dist/${{ matrix.artifact }}

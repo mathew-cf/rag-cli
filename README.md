@@ -57,29 +57,8 @@ Prints index metadata: model, chunk count, source file count, index size, etc.
 
 ## Hardware acceleration
 
-The default feature flags target Apple Silicon. To build for different hardware,
-use `--no-default-features` and enable the features you need:
-
-```bash
-# Apple Silicon (default) — Metal GPU + Accelerate BLAS
-cargo build --release
-
-# NVIDIA GPU
-cargo build --release --no-default-features --features cuda
-
-# CPU only (portable, no GPU)
-cargo build --release --no-default-features
-```
-
-| Feature | What it enables |
-|---------|----------------|
-| `metal` | Apple Metal GPU backend (macOS) |
-| `accelerate` | Apple Accelerate framework for BLAS (macOS) |
-| `cuda` | NVIDIA CUDA GPU backend (requires CUDA toolkit) |
-
-Metal and Accelerate are enabled together by default. On a machine without a
-Metal GPU, candle falls back to CPU automatically — you don't need a separate
-build, but disabling unused features will shrink compile times.
+On macOS, Metal GPU and Accelerate BLAS are enabled automatically. On other
+platforms the build falls back to CPU — no extra flags are needed.
 
 ## Model management
 
