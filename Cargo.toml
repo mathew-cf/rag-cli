@@ -6,6 +6,10 @@ description = "Local-first RAG CLI powered by candle for semantic search over yo
 license = "Apache-2.0"
 repository = "https://github.com/mathew-cf/rag-cli"
 
+[[bin]]
+name = "rag"
+path = "src/main.rs"
+
 [dependencies]
 # ML framework
 candle-core = "0.9"
