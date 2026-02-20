@@ -108,7 +108,7 @@ jobs:
         run: sleep 30
 
       - name: Publish rag-cli-cuda to crates.io
-        run: cargo publish -p rag-cli-cuda
+        run: cargo publish -p rag-cli-cuda --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
