@@ -82,6 +82,7 @@ jobs:
           new="${major}.${minor}.${patch}"
           sed -i "0,/^version = \".*\"/s//version = \"${new}\"/" Cargo.toml
           sed -i "0,/^version = \".*\"/s//version = \"${new}\"/" rag-cli-cuda/Cargo.toml
+          sed -i "s/rag-cli = { version = \"[^\"]*\"/rag-cli = { version = \"${new}\"/" rag-cli-cuda/Cargo.toml
           echo "version=${new}" >> "$GITHUB_OUTPUT"
 
       - name: Update lockfile
