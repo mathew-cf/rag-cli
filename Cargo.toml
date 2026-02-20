@@ -3,7 +3,7 @@ members = [".", "rag-cli-cuda"]
 
 [package]
 name = "rag-cli"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Local-first RAG CLI powered by candle for semantic search over your files"
 license = "Apache-2.0"
