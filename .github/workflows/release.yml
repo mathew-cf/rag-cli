@@ -32,9 +32,21 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+  build-cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.27
+        with:
+          cuda: "12.6.3"
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "curand-dev"]'
+      - name: Check CUDA crate compiles
+        run: cargo check -p rag-cli-cuda --verbose
+
   publish:
     name: Publish to crates.io
-    needs: build
+    needs: [build, build-cuda]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: release
@@ -66,6 +78,7 @@ jobs:
           esac
           new="${major}.${minor}.${patch}"
           sed -i "0,/^version = \".*\"/s//version = \"${new}\"/" Cargo.toml
+          sed -i "0,/^version = \".*\"/s//version = \"${new}\"/" rag-cli-cuda/Cargo.toml
           echo "version=${new}" >> "$GITHUB_OUTPUT"
 
       - name: Update lockfile
@@ -73,7 +86,7 @@ jobs:
 
       - name: Commit and tag
         run: |
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml rag-cli-cuda/Cargo.toml Cargo.lock
           git commit -m "chore: release v${{ steps.version.outputs.version }}"
           git tag "v${{ steps.version.outputs.version }}"
           git push --follow-tags
@@ -82,8 +95,16 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
-      - name: Publish to crates.io
-        run: cargo publish
+      - name: Publish rag-cli to crates.io
+        run: cargo publish -p rag-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
+      - name: Publish rag-cli-cuda to crates.io
+        run: cargo publish -p rag-cli-cuda
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
@@ -95,27 +116,45 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: rag-cli-linux-x86_64
+            artifact: rag-linux-x86_64
+            cuda: false
           - os: macos-latest
-            artifact: rag-cli-macos-aarch64
+            artifact: rag-macos-aarch64
+            cuda: false
+          - os: ubuntu-latest
+            artifact: rag-linux-x86_64-cuda
+            cuda: true
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main # Get the version-bumped commit from publish job
+          ref: main
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install CUDA toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.27
+        with:
+          cuda: "12.6.3"
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "curand-dev"]'
+
       - name: Build release binary
-        run: cargo build --release
+        run: |
+          if [ "${{ matrix.cuda }}" = "true" ]; then
+            cargo build --release -p rag-cli-cuda
+          else
+            cargo build --release -p rag-cli
+          fi
 
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/release/rag-cli dist/${{ matrix.artifact }}
+          cp target/release/rag dist/${{ matrix.artifact }}
           chmod +x dist/${{ matrix.artifact }}
 
       - name: Upload to GitHub release

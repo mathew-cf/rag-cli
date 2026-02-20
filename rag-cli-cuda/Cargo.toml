@@ -1,6 +1,6 @@
 [package]
 name = "rag-cli-cuda"
-version = "0.1.2"
+version = "0.1.4"
 edition = "2021"
 description = "CUDA-accelerated build of rag-cli — local semantic search powered by candle + NVIDIA GPU"
 license = "Apache-2.0"
@@ -11,5 +11,5 @@ name = "rag"
 path = "src/main.rs"
 
 [dependencies]
-rag-cli = { path = "..", features = ["cuda"] }
+rag-cli = { version = "0.1.4", path = "..", features = ["cuda"] }
 anyhow = "1"
