@@ -44,6 +44,8 @@ jobs:
           non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
       - name: Check CUDA crate compiles
         run: cargo check -p rag-cli-cuda --verbose
+        env:
+          CUDA_COMPUTE_CAP: "80"
 
   publish:
     name: Publish to crates.io
@@ -152,6 +154,8 @@ jobs:
           else
             cargo build --release -p rag-cli
           fi
+        env:
+          CUDA_COMPUTE_CAP: "80"
 
       - name: Package binary
         run: |
