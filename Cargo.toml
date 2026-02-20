@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "rag-cli-cuda"]
+
 [package]
 name = "rag-cli"
 version = "0.1.4"
@@ -6,9 +9,16 @@ description = "Local-first RAG CLI powered by candle for semantic search over yo
 license = "Apache-2.0"
 repository = "https://github.com/mathew-cf/rag-cli"
 
+[lib]
+name = "rag_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rag"
 path = "src/main.rs"
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 [dependencies]
 # ML framework
@@ -42,5 +52,3 @@ walkdir = "2"
 candle-core = { version = "0.9", features = ["metal", "accelerate"] }
 candle-nn = { version = "0.9", features = ["metal", "accelerate"] }
 candle-transformers = { version = "0.9", features = ["metal", "accelerate"] }
-
-

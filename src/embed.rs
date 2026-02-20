@@ -271,6 +271,13 @@ impl EmbeddingEngine {
 
 /// Select the best available device.
 pub fn select_device() -> Result<Device> {
+    #[cfg(feature = "cuda")]
+    {
+        if let Ok(device) = Device::new_cuda(0) {
+            eprintln!("Using CUDA GPU");
+            return Ok(device);
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         if let Ok(device) = Device::new_metal(0) {

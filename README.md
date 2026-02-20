@@ -57,8 +57,19 @@ Prints index metadata: model, chunk count, source file count, index size, etc.
 
 ## Hardware acceleration
 
-On macOS, Metal GPU and Accelerate BLAS are enabled automatically. On other
-platforms the build falls back to CPU — no extra flags are needed.
+On macOS, Metal GPU and Accelerate BLAS are enabled automatically.
+
+For NVIDIA GPUs, install the CUDA build:
+
+```
+cargo install rag-cli-cuda
+```
+
+This requires the CUDA toolkit to be installed on your system. The binary name
+is the same (`rag`), so it's a drop-in replacement.
+
+On other platforms the default build falls back to CPU — no extra flags are
+needed.
 
 ## Model management
 
