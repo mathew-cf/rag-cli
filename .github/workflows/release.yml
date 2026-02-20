@@ -40,7 +40,8 @@ jobs:
         with:
           cuda: "12.6.3"
           method: network
-          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "curand-dev"]'
+          sub-packages: '["nvcc", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
       - name: Check CUDA crate compiles
         run: cargo check -p rag-cli-cuda --verbose
 
@@ -141,7 +142,8 @@ jobs:
         with:
           cuda: "12.6.3"
           method: network
-          sub-packages: '["nvcc", "cudart-dev", "cublas-dev", "curand-dev"]'
+          sub-packages: '["nvcc", "cudart-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
 
       - name: Build release binary
         run: |
