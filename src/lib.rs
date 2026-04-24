@@ -9,7 +9,10 @@ use std::time::Instant;
 
 use std::collections::BTreeMap;
 
-use crate::embed::{select_device, EmbeddingEngine, DEFAULT_MODEL};
+use crate::embed::{
+    download_model, model_file_list, model_files_present, resolve_hf_cache, select_device,
+    EmbeddingEngine, DEFAULT_MODEL,
+};
 use crate::index::{search_top_k, ChunkRecord, Index, IndexMeta};
 use crate::ingest::{chunk_file, discover_files, hash_files};
 
@@ -87,6 +90,22 @@ enum Commands {
         #[arg(short, long)]
         index: Option<PathBuf>,
     },
+
+    /// Pre-download the embedding model weights + tokenizer into the cache.
+    ///
+    /// Useful on fresh installs: makes the first `rag index`/`rag search`
+    /// fast instead of stalling on a ~90MB network fetch. Safe to re-run —
+    /// if every file is already cached it exits immediately.
+    Download {
+        /// HuggingFace model ID for embeddings.
+        #[arg(short, long, default_value = DEFAULT_MODEL)]
+        model: String,
+
+        /// Verify the model loads successfully after downloading (runs a
+        /// tiny inference to catch corrupt downloads).
+        #[arg(long)]
+        verify: bool,
+    },
 }
 
 /// Entry point for the CLI. Call this from `main()`.
@@ -126,7 +145,53 @@ pub fn run() -> Result<()> {
             cache_dir,
         ),
         Commands::Info { index } => cmd_info(index.as_deref()),
+        Commands::Download { model, verify } => cmd_download(&model, verify, cache_dir),
     }
+}
+
+fn cmd_download(
+    model_id: &str,
+    verify: bool,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let start = Instant::now();
+    let hub_root = resolve_hf_cache(cache_dir)?;
+
+    eprintln!("Model: {model_id}");
+    eprintln!("Cache: {}", hub_root.display());
+
+    if model_files_present(&hub_root, model_id) {
+        eprintln!(
+            "All {} model file(s) already cached.",
+            model_file_list().len()
+        );
+    } else {
+        let downloaded = download_model(model_id, cache_dir)?;
+        if downloaded {
+            eprintln!(
+                "Downloaded {} file(s) in {:.1}s",
+                model_file_list().len(),
+                start.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    if verify {
+        eprintln!("Verifying model loads and produces embeddings...");
+        let device = select_device()?;
+        let engine = EmbeddingEngine::load(Some(model_id), &device, cache_dir)?;
+        let vec = engine.embed_one("hello world")?;
+        if vec.is_empty() {
+            anyhow::bail!("Model produced an empty embedding — installation may be corrupt");
+        }
+        eprintln!(
+            "  Verified (hidden_size={}, elapsed={:.1}s)",
+            vec.len(),
+            start.elapsed().as_secs_f64()
+        );
+    }
+
+    Ok(())
 }
 
 fn cmd_index(

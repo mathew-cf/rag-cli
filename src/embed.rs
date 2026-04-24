@@ -118,6 +118,37 @@ fn ensure_model_files(hub_root: &Path, model_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check whether every required model file is already present locally.
+///
+/// Cheap: just stats each file without hitting the network. Returned
+/// separately from `download_model` so callers can distinguish "already
+/// cached" from "downloaded this run" in their output.
+pub fn model_files_present(hub_root: &Path, model_id: &str) -> bool {
+    MODEL_FILES
+        .iter()
+        .all(|f| snapshot_path(hub_root, model_id, f).exists())
+}
+
+/// The list of files that make up a usable embedding model snapshot.
+/// Exposed so the `rag download` command can print per-file status.
+pub fn model_file_list() -> &'static [&'static str] {
+    MODEL_FILES
+}
+
+/// Ensure the weights and tokenizer for `model_id` are present in the
+/// HuggingFace-style cache rooted at `hub_root`, downloading any missing
+/// files over HTTPS. Used by the `rag download` command so users can
+/// warm the cache ahead of their first `rag index` or `rag search`.
+///
+/// Returns `true` if any file had to be downloaded (useful when the
+/// caller wants to print "already cached" vs. "freshly downloaded").
+pub fn download_model(model_id: &str, cache_dir: Option<&Path>) -> Result<bool> {
+    let hub_root = resolve_hf_cache(cache_dir)?;
+    let before = model_files_present(&hub_root, model_id);
+    ensure_model_files(&hub_root, model_id)?;
+    Ok(!before)
+}
+
 // ---------------------------------------------------------------------------
 // Embedding engine
 // ---------------------------------------------------------------------------
