@@ -1,0 +1,35 @@
+{
+  "name": "@mathew-cf/rag-cli",
+  "version": "0.0.0-PLACEHOLDER",
+  "description": "Local-first RAG CLI — semantic search over your files using local embeddings",
+  "license": "Apache-2.0",
+  "author": "mathew-cf",
+  "homepage": "https://github.com/mathew-cf/rag-cli",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mathew-cf/rag-cli"
+  },
+  "keywords": [
+    "rag",
+    "semantic-search",
+    "embeddings",
+    "cli",
+    "local-first"
+  ],
+  "bin": {
+    "rag": "bin/rag.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "optionalDependencies": {
+    "@mathew-cf/rag-cli-darwin-arm64": "0.0.0-PLACEHOLDER",
+    "@mathew-cf/rag-cli-darwin-x64": "0.0.0-PLACEHOLDER",
+    "@mathew-cf/rag-cli-linux-x64": "0.0.0-PLACEHOLDER",
+    "@mathew-cf/rag-cli-linux-arm64": "0.0.0-PLACEHOLDER"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

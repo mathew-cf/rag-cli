@@ -6,15 +6,35 @@ with natural language — all embeddings are computed on your machine using
 
 ## Quick start
 
-```
-cargo install --path .
+Install (choose one):
 
+```bash
+# Via npm (prebuilt binary, no Rust toolchain needed)
+npm install -g @mathew-cf/rag-cli
+
+# Via Cargo (builds from source)
+cargo install rag-cli
+
+# From the repo
+cargo install --path .
+```
+
+Use:
+
+```bash
 # Index a directory
 rag index ./my-project
 
 # Search it
 rag search "how does authentication work"
+
+# Pre-cache the embedding model (optional — makes first use faster)
+rag download
 ```
+
+### Supported npm platforms
+
+Prebuilt binaries are published for macOS ARM64, macOS x86_64, Linux x86_64, and Linux ARM64. On any other platform, fall back to `cargo install rag-cli`.
 
 ## Commands
 

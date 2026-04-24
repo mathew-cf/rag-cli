@@ -19,3 +19,18 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Node / npm publishing workflow
+node_modules/
+.rag/
+.DS_Store
+
+# Per-platform binaries get dropped into npm/rag-cli-*/bin/ by CI —
+# the .gitkeep files keep the dirs in tree, the actual binaries never
+# get committed.
+npm/rag-cli-*/bin/rag
+npm/rag-cli-*/bin/rag.exe
+
+# prepare-npm.js writes versions into these at release time; the
+# versioned files should not be committed (we commit the placeholder).
+npm/**/package-lock.json

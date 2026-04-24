@@ -1,0 +1,9 @@
+{
+  "name": "rag-cli-workspace",
+  "private": true,
+  "description": "Workspace root for rag-cli — hosts the Node test harness for the npm publishing scripts. NOT published.",
+  "scripts": {
+    "test": "node --test test/npm-platform.test.js test/prepare-npm.test.js",
+    "prepare-npm": "node scripts/prepare-npm.js"
+  }
+}
