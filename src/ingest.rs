@@ -4,44 +4,22 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 /// Text file extensions we'll index.
+///
+/// Programming language source files (e.g. .rs, .py, .ts, .go) and .json are
+/// intentionally excluded — RAG indexing is aimed at prose/docs/config, not code.
 const TEXT_EXTENSIONS: &[&str] = &[
+    // Docs / prose
     "txt",
     "md",
-    "rs",
-    "py",
-    "js",
-    "ts",
-    "go",
-    "java",
-    "c",
-    "cpp",
-    "h",
-    "hpp",
-    "rb",
-    "sh",
-    "bash",
-    "zsh",
-    "fish",
-    "toml",
-    "yaml",
-    "yml",
-    "json",
-    "xml",
-    "html",
-    "css",
-    "scss",
-    "sql",
-    "proto",
-    "graphql",
-    "dockerfile",
-    "makefile",
-    "cmake",
     "tex",
     "org",
     "rst",
+    // Data
     "csv",
     "tsv",
     "log",
+    // Config
+    "toml",
     "conf",
     "cfg",
     "ini",
@@ -49,25 +27,17 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "tf",
     "hcl",
     "nix",
-    "lua",
-    "vim",
-    "el",
-    "lisp",
-    "clj",
-    "ex",
-    "exs",
-    "erl",
-    "hs",
-    "ml",
-    "mli",
-    "scala",
-    "kt",
-    "swift",
-    "r",
-    "jl",
-    "php",
-    "pl",
-    "pm",
+    // Markup
+    "xml",
+    "html",
+    // Schemas
+    "sql",
+    "proto",
+    "graphql",
+    // Build
+    "dockerfile",
+    "makefile",
+    "cmake",
 ];
 
 /// Files with no extension that are likely text.
