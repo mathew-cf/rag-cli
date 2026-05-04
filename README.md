@@ -118,11 +118,22 @@ rag index ./docs
 
 ## Supported file types
 
-rag-cli indexes 60+ text file extensions including common source code (`.rs`,
-`.py`, `.js`, `.ts`, `.go`, `.java`, `.c`, `.cpp`, etc.), markup (`.md`,
-`.html`, `.tex`, `.rst`), config (`.toml`, `.yaml`, `.json`, `.ini`), and
-infrastructure files (`.tf`, `.hcl`, `.dockerfile`, `.nix`). Files like
-`Makefile`, `Dockerfile`, `LICENSE`, and `.gitignore` are recognized by name.
+rag-cli is aimed at prose, docs, and config — not source code. It indexes:
+
+- **Docs / prose**: `.md`, `.txt`, `.tex`, `.org`, `.rst`
+- **Data**: `.csv`, `.tsv`, `.log`
+- **Config**: `.toml`, `.conf`, `.cfg`, `.ini`, `.env`, `.tf`, `.hcl`, `.nix`
+- **Markup**: `.xml`, `.html`
+- **Schemas**: `.sql`, `.proto`, `.graphql`
+- **Build**: `Dockerfile`, `Makefile`, `.cmake`
+
+Files like `Makefile`, `Dockerfile`, `LICENSE`, `README`, and `.gitignore` are
+recognized by name.
+
+Programming language sources (`.rs`, `.py`, `.ts`, `.go`, `.js`, shell scripts,
+etc.), `.json`, `.yaml`/`.yml`, and `.css`/`.scss` are intentionally **not**
+indexed — they tend to drown out useful matches with boilerplate. Index your
+code with a code-aware tool instead.
 
 Hidden directories, `node_modules`, `target`, `__pycache__`, `vendor`, `dist`,
 and `build` are skipped automatically.
