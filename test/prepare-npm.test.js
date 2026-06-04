@@ -16,6 +16,7 @@ const path = require("node:path");
 const {
   PLATFORM_TARGETS,
   applyVersion,
+  binaryFilename,
   listPackageJsons,
   parseArgs,
   parseCargoVersion,
@@ -129,8 +130,8 @@ test("stageBinaries copies the binary into every platform's bin dir", () => {
   }
 
   // Seed synthetic binaries at the expected layout.
-  for (const target of Object.values(PLATFORM_TARGETS)) {
-    const src = path.join(artifacts, `rag-${target}`, "rag");
+  for (const [platKey, target] of Object.entries(PLATFORM_TARGETS)) {
+    const src = path.join(artifacts, `rag-${target}`, binaryFilename(platKey));
     fs.mkdirSync(path.dirname(src), { recursive: true });
     fs.writeFileSync(src, `#!/bin/sh\necho ${target}\n`);
   }
@@ -139,7 +140,12 @@ test("stageBinaries copies the binary into every platform's bin dir", () => {
   assert.equal(staged.length, Object.keys(PLATFORM_TARGETS).length);
 
   for (const platKey of Object.keys(PLATFORM_TARGETS)) {
-    const dst = path.join(root, `rag-cli-${platKey}`, "bin", "rag");
+    const dst = path.join(
+      root,
+      `rag-cli-${platKey}`,
+      "bin",
+      binaryFilename(platKey),
+    );
     assert.ok(fs.existsSync(dst), `${platKey} binary should exist at ${dst}`);
     const mode = fs.statSync(dst).mode & 0o777;
     assert.ok(

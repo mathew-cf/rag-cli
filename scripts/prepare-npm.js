@@ -38,7 +38,12 @@ const PLATFORM_TARGETS = Object.freeze({
   "darwin-x64": "x86_64-apple-darwin",
   "linux-x64": "x86_64-unknown-linux-gnu",
   "linux-arm64": "aarch64-unknown-linux-gnu",
+  "win32-x64": "x86_64-pc-windows-msvc",
 });
+
+function binaryFilename(platKey) {
+  return platKey.startsWith("win32-") ? "rag.exe" : "rag";
+}
 
 /**
  * Extract the first `version = "..."` from a Cargo.toml string.
@@ -86,24 +91,25 @@ function writeVersion(version, root = NPM_ROOT) {
 }
 
 /**
- * Copy platform binaries into the matching npm/rag-cli-<plat>/bin/rag.
+ * Copy platform binaries into the matching npm/rag-cli-<plat>/bin/<binary>.
  *
  * `layout` describes where the binaries live within the artifacts
  * directory — see the release workflow's artifact naming. The default
- * follows the `rag-<target>/rag` convention we emit from the CI build.
+ * follows the `rag-<target>/<binary>` convention we emit from the CI build.
  */
 function stageBinaries(
   artifactsDir,
   {
-    layout = (target) => `rag-${target}/rag`,
+    layout = (target, platKey) => `rag-${target}/${binaryFilename(platKey)}`,
     platforms = PLATFORM_TARGETS,
     npmRoot = NPM_ROOT,
   } = {},
 ) {
   const staged = [];
   for (const [platKey, target] of Object.entries(platforms)) {
-    const src = path.join(artifactsDir, layout(target));
-    const dst = path.join(npmRoot, `rag-cli-${platKey}`, "bin", "rag");
+    const filename = binaryFilename(platKey);
+    const src = path.join(artifactsDir, layout(target, platKey));
+    const dst = path.join(npmRoot, `rag-cli-${platKey}`, "bin", filename);
 
     if (!fs.existsSync(src)) {
       throw new Error(
@@ -159,6 +165,7 @@ module.exports = {
   PLACEHOLDER,
   PLATFORM_TARGETS,
   applyVersion,
+  binaryFilename,
   listPackageJsons,
   parseArgs,
   parseCargoVersion,

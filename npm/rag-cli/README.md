@@ -9,7 +9,7 @@ rag index ./my-project
 rag search "how does authentication work"
 ```
 
-On install, npm fetches the prebuilt binary for your platform via `optionalDependencies`. Supported platforms: macOS ARM64, macOS x86_64, Linux x86_64, Linux ARM64.
+On install, npm fetches the prebuilt binary for your platform via `optionalDependencies`. Supported platforms: macOS ARM64, macOS x86_64, Linux x86_64, Linux ARM64, Windows x86_64.
 
 On any other platform, install from source instead:
 

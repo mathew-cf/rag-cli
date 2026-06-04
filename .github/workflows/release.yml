@@ -23,7 +23,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -136,27 +136,38 @@ jobs:
             target: aarch64-apple-darwin
             release_artifact: rag-macos-aarch64
             npm_artifact: rag-aarch64-apple-darwin
+            binary: rag
             cuda: false
           - os: macos-15-intel
             target: x86_64-apple-darwin
             release_artifact: rag-macos-x86_64
             npm_artifact: rag-x86_64-apple-darwin
+            binary: rag
             cuda: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             release_artifact: rag-linux-x86_64
             npm_artifact: rag-x86_64-unknown-linux-gnu
+            binary: rag
             cuda: false
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             release_artifact: rag-linux-aarch64
             npm_artifact: rag-aarch64-unknown-linux-gnu
+            binary: rag
+            cuda: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            release_artifact: rag-windows-x86_64.exe
+            npm_artifact: rag-x86_64-pc-windows-msvc
+            binary: rag.exe
             cuda: false
           # CUDA: only ever distributed via crates.io + GitHub release (not npm).
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             release_artifact: rag-linux-x86_64-cuda
             npm_artifact: "" # not published to npm
+            binary: rag
             cuda: true
     runs-on: ${{ matrix.os }}
     permissions:
@@ -181,6 +192,7 @@ jobs:
           non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
 
       - name: Build release binary
+        shell: bash
         run: |
           if [ "${{ matrix.cuda }}" = "true" ]; then
             cargo build --release --target ${{ matrix.target }} -p rag-cli-cuda
@@ -191,10 +203,13 @@ jobs:
           CUDA_COMPUTE_CAP: "80"
 
       - name: Package binary for GitHub release
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/rag dist/${{ matrix.release_artifact }}
-          chmod +x dist/${{ matrix.release_artifact }}
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.release_artifact }}"
+          if [ "${{ matrix.binary }}" != "rag.exe" ]; then
+            chmod +x "dist/${{ matrix.release_artifact }}"
+          fi
 
       - name: Upload to GitHub release
         uses: softprops/action-gh-release@v2
@@ -208,7 +223,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.npm_artifact }}
-          path: target/${{ matrix.target }}/release/rag
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 1
 
@@ -246,10 +261,17 @@ jobs:
       - name: Verify artifacts look right
         run: |
           ls -la artifacts/
-          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-            test -f "artifacts/rag-$target/rag" \
-              || { echo "Missing artifact: rag-$target/rag"; exit 1; }
-            file "artifacts/rag-$target/rag" || true
+          for artifact in \
+            aarch64-apple-darwin:rag \
+            x86_64-apple-darwin:rag \
+            x86_64-unknown-linux-gnu:rag \
+            aarch64-unknown-linux-gnu:rag \
+            x86_64-pc-windows-msvc:rag.exe; do
+            target="${artifact%%:*}"
+            binary="${artifact##*:}"
+            path="artifacts/rag-$target/$binary"
+            test -f "$path" || { echo "Missing artifact: $path"; exit 1; }
+            file "$path" || true
           done
 
       - name: Prepare npm packages
@@ -283,7 +305,7 @@ jobs:
       - name: Publish platform packages
         run: |
           set -e
-          for pkg in rag-cli-darwin-arm64 rag-cli-darwin-x64 rag-cli-linux-x64 rag-cli-linux-arm64; do
+          for pkg in rag-cli-darwin-arm64 rag-cli-darwin-x64 rag-cli-linux-x64 rag-cli-linux-arm64 rag-cli-win32-x64; do
             echo "::group::Publish $pkg"
             (cd "npm/$pkg" && npm publish --access public --provenance)
             echo "::endgroup::"

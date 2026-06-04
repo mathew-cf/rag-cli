@@ -14,7 +14,8 @@ workflow stitches everything together.
 │  ├─ @mathew-cf/rag-cli-darwin-arm64   prebuilt, os+cpu restricted
 │  ├─ @mathew-cf/rag-cli-darwin-x64
 │  ├─ @mathew-cf/rag-cli-linux-x64
-│  └─ @mathew-cf/rag-cli-linux-arm64
+│  ├─ @mathew-cf/rag-cli-linux-arm64
+│  └─ @mathew-cf/rag-cli-win32-x64
 ```
 
 On install, npm evaluates `os` and `cpu` and only fetches the matching
@@ -31,7 +32,7 @@ OIDC and the token can be revoked.
 
 ### Step 1: local bootstrap publish
 
-Run once for each of the 5 packages:
+Run once for each of the 6 packages:
 
 ```bash
 # Fill placeholders with the current version. Use a pre-release tag so
@@ -39,20 +40,22 @@ Run once for each of the 5 packages:
 node scripts/prepare-npm.js --version=0.3.2-bootstrap
 
 # Stage real binaries into each platform package. `cargo build --release`
-# only produces the host triple; the other three platforms can use a
+# only produces the host triple; the other platforms can use a
 # dummy binary for the bootstrap publish because no one will ever
 # install 0.3.2-bootstrap anyway — they're just placeholder artefacts.
-for plat in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+for plat in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
   mkdir -p "npm/rag-cli-$plat/bin"
-  echo '#!/bin/sh' > "npm/rag-cli-$plat/bin/rag"
-  echo 'echo bootstrap-only placeholder; exit 1' >> "npm/rag-cli-$plat/bin/rag"
-  chmod +x "npm/rag-cli-$plat/bin/rag"
+  bin=rag
+  if [ "$plat" = "win32-x64" ]; then bin=rag.exe; fi
+  echo '#!/bin/sh' > "npm/rag-cli-$plat/bin/$bin"
+  echo 'echo bootstrap-only placeholder; exit 1' >> "npm/rag-cli-$plat/bin/$bin"
+  chmod +x "npm/rag-cli-$plat/bin/$bin"
 done
 
 # Publish each package. `--tag bootstrap` keeps these versions from
 # becoming the default "latest" dist-tag.
 npm login # one-time
-for pkg in rag-cli-darwin-arm64 rag-cli-darwin-x64 rag-cli-linux-x64 rag-cli-linux-arm64 rag-cli; do
+for pkg in rag-cli-darwin-arm64 rag-cli-darwin-x64 rag-cli-linux-x64 rag-cli-linux-arm64 rag-cli-win32-x64 rag-cli; do
   (cd "npm/$pkg" && npm publish --access public --tag bootstrap)
 done
 
@@ -62,7 +65,7 @@ git restore npm/
 
 ### Step 2: configure Trusted Publishing on npm
 
-For each of the 5 packages (meta + 4 platforms) on https://www.npmjs.com :
+For each of the 6 packages (meta + 5 platforms) on https://www.npmjs.com :
 
 1. Open the package page → **Settings** → **Publishing access**
 2. Click **Add trusted publisher** → **GitHub Actions**
@@ -73,7 +76,7 @@ For each of the 5 packages (meta + 4 platforms) on https://www.npmjs.com :
    - **Environment name**: `release` (must match the `environment:` key in the workflow)
 4. Save.
 
-After this is done for all five, subsequent `npm publish` calls from
+After this is done for all six, subsequent `npm publish` calls from
 `.github/workflows/release.yml` will use OIDC — no credential needed.
 
 ### Step 3: revoke the bootstrap token
@@ -87,7 +90,7 @@ forward, all publishing happens via trusted publishing.
 Trigger the `CI / Release` workflow with a version bump choice (patch /
 minor / major). The workflow will:
 
-1. Build the Rust binary for each of 4 platforms
+1. Build the Rust binary for each of 5 platforms
 2. Upload each binary as a GitHub Actions artifact
 3. Run `scripts/prepare-npm.js` to version and stage the packages
 4. `npm publish --access public --provenance` each one via OIDC
@@ -104,13 +107,15 @@ You can exercise most of the pipeline without touching npm:
 # Build a host binary
 cargo build --release
 
-# Stage it as all four platforms (fine for a smoke test)
+# Stage it as all five platforms (fine for a smoke test)
 mkdir -p /tmp/rag-artifacts
 for t in aarch64-apple-darwin x86_64-apple-darwin \
          x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
   mkdir -p "/tmp/rag-artifacts/rag-$t"
   cp target/release/rag "/tmp/rag-artifacts/rag-$t/rag"
 done
+mkdir -p /tmp/rag-artifacts/rag-x86_64-pc-windows-msvc
+cp target/release/rag /tmp/rag-artifacts/rag-x86_64-pc-windows-msvc/rag.exe
 
 # Fill placeholders + stage binaries
 node scripts/prepare-npm.js --version=0.0.0-dryrun \

@@ -34,7 +34,7 @@ rag download
 
 ### Supported npm platforms
 
-Prebuilt binaries are published for macOS ARM64, macOS x86_64, Linux x86_64, and Linux ARM64. On any other platform, fall back to `cargo install rag-cli`.
+Prebuilt binaries are published for macOS ARM64, macOS x86_64, Linux x86_64, Linux ARM64, and Windows x86_64. On any other platform, fall back to `cargo install rag-cli`.
 
 ## Commands
 

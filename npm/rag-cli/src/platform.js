@@ -31,6 +31,7 @@ const SUPPORTED_PLATFORMS = Object.freeze([
   "darwin-x64",
   "linux-x64",
   "linux-arm64",
+  "win32-x64",
 ]);
 
 /**
@@ -51,9 +52,7 @@ function subpackageName(key) {
 
 /**
  * Name of the binary file inside a subpackage's `bin/` directory.
- * Windows binaries would be `rag.exe`; Unix platforms use `rag`.
- * Currently all supported platforms are Unix — this helper is the
- * single place to update when/if win32 support lands.
+ * Windows binaries are `rag.exe`; Unix platforms use `rag`.
  */
 function binaryFilename(platform) {
   return platform === "win32" ? "rag.exe" : "rag";

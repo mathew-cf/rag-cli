@@ -32,7 +32,7 @@ test("isSupported recognises every published platform", () => {
 test("isSupported rejects unknown platforms", () => {
   assert.equal(isSupported("freebsd-x64"), false);
   assert.equal(isSupported("linux-riscv64"), false);
-  assert.equal(isSupported("win32-x64"), false); // not yet published
+  assert.equal(isSupported("win32-arm64"), false);
   assert.equal(isSupported(""), false);
 });
 
@@ -44,6 +44,7 @@ test("SUPPORTED_PLATFORMS matches the current publish matrix", () => {
     "darwin-x64",
     "linux-x64",
     "linux-arm64",
+    "win32-x64",
   ]);
 });
 
@@ -59,6 +60,7 @@ test("subpackageName uses the @mathew-cf scope", () => {
     "@mathew-cf/rag-cli-darwin-arm64",
   );
   assert.equal(subpackageName("linux-x64"), "@mathew-cf/rag-cli-linux-x64");
+  assert.equal(subpackageName("win32-x64"), "@mathew-cf/rag-cli-win32-x64");
 });
 
 test("binaryFilename picks .exe for win32 and rag for Unix", () => {
