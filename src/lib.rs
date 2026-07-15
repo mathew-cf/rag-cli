@@ -1,20 +1,22 @@
+mod config;
 mod embed;
 mod index;
 mod ingest;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use std::collections::BTreeMap;
 
+use crate::config::RagConfig;
 use crate::embed::{
     download_model, model_file_list, model_files_present, resolve_hf_cache, select_device,
     EmbeddingEngine, DEFAULT_MODEL,
 };
 use crate::index::{search_top_k, ChunkRecord, Index, IndexMeta};
-use crate::ingest::{chunk_file, discover_files, hash_files};
+use crate::ingest::{chunk_file, discover_files, hash_files, DiscoveryConfig};
 
 const DEFAULT_CHUNK_SIZE: usize = 512;
 const DEFAULT_CHUNK_OVERLAP: usize = 64;
@@ -36,10 +38,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index a directory of text files for semantic search.
+    /// Index text files for semantic search.
+    ///
+    /// With a PATH, indexes that single directory using the flags below. With
+    /// no PATH, reads a config file (`rag.toml` / `.rag.toml`, or `--config`)
+    /// and builds every `[[index]]` it declares.
     Index {
-        /// Directory to index.
-        path: PathBuf,
+        /// Directory to index. Omit to build every index in the config file.
+        path: Option<PathBuf>,
+
+        /// Config file to build from when no PATH is given
+        /// (default: ./rag.toml or ./.rag.toml).
+        #[arg(short = 'c', long)]
+        config: Option<PathBuf>,
+
+        /// In config mode, build only these named indexes (comma-separated or
+        /// repeated). Useful to skip slow indexes you didn't change.
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
 
         /// Where to store the index (default: .rag in current directory).
         #[arg(short, long)]
@@ -56,6 +72,21 @@ enum Commands {
         /// Chunk overlap in characters.
         #[arg(long, default_value_t = DEFAULT_CHUNK_OVERLAP)]
         chunk_overlap: usize,
+
+        /// Extra file extensions to index, beyond the built-in allowlist
+        /// (comma-separated or repeated), e.g. `--ext mdx,rst`.
+        #[arg(long, value_delimiter = ',')]
+        ext: Vec<String>,
+
+        /// Directory/file specs to skip (comma-separated or repeated). A bare
+        /// name matches any path component; a spec with `/` is a path prefix.
+        #[arg(long, value_delimiter = ',')]
+        exclude: Vec<String>,
+
+        /// Normally-skipped directories to index anyway (comma-separated or
+        /// repeated), e.g. `--include dist`.
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
     },
 
     /// Search the index with a natural language query.
@@ -116,18 +147,51 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Index {
             path,
+            config,
+            only,
             output,
             model,
             chunk_size,
             chunk_overlap,
-        } => cmd_index(
-            &path,
-            output.as_deref(),
-            &model,
-            chunk_size,
-            chunk_overlap,
-            cache_dir,
-        ),
+            ext,
+            exclude,
+            include,
+        } => match path {
+            Some(path) => {
+                // `--only` selects among config entries; it has no meaning for a
+                // single ad-hoc index.
+                if !only.is_empty() {
+                    eprintln!("warning: --only is ignored when a PATH is given");
+                }
+                let discovery = DiscoveryConfig {
+                    extra_extensions: ext,
+                    exclude,
+                    include,
+                };
+                cmd_index(
+                    &path,
+                    output.as_deref(),
+                    &model,
+                    chunk_size,
+                    chunk_overlap,
+                    &discovery,
+                    cache_dir,
+                )
+            }
+            None => {
+                // Config mode: each `[[index]]` entry is self-describing, so the
+                // ad-hoc single-index flags don't apply. Warn rather than
+                // silently ignore them.
+                if output.is_some() || !ext.is_empty() || !exclude.is_empty() || !include.is_empty()
+                {
+                    eprintln!(
+                        "warning: --output/--ext/--exclude/--include are ignored when building \
+                         from a config file; set them per-[[index]] in the config instead"
+                    );
+                }
+                cmd_index_from_config(config.as_deref(), &only, cache_dir)
+            }
+        },
         Commands::Search {
             query,
             index,
@@ -195,11 +259,12 @@ fn cmd_download(
 }
 
 fn cmd_index(
-    path: &PathBuf,
+    path: &Path,
     output: Option<&std::path::Path>,
     model_id: &str,
     chunk_size: usize,
     chunk_overlap: usize,
+    discovery: &DiscoveryConfig,
     cache_dir: Option<&std::path::Path>,
 ) -> Result<()> {
     let start = Instant::now();
@@ -216,7 +281,7 @@ fn cmd_index(
 
     // 1. Discover files and hash them
     eprintln!("Indexing: {}", root.display());
-    let files = discover_files(&root)?;
+    let files = discover_files(&root, discovery)?;
     eprintln!("Found {} text files", files.len());
 
     if files.is_empty() {
@@ -286,6 +351,103 @@ fn cmd_index(
         index.meta.num_chunks,
         elapsed.as_secs_f64()
     );
+
+    Ok(())
+}
+
+/// Build every index declared in a `rag.toml` config file.
+///
+/// Paths and output dirs in the config are resolved relative to the config
+/// file's own directory, so `rag index` works from anywhere as long as
+/// `--config` points at the file.
+fn cmd_index_from_config(
+    config_path: Option<&std::path::Path>,
+    only: &[String],
+    cache_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+
+    let config_path = RagConfig::locate(config_path, &cwd).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No path given and no config file found. Pass a directory to index, or create a \
+             {} file (or pass --config <file>).",
+            config::DEFAULT_CONFIG_NAMES[0]
+        )
+    })?;
+
+    let base = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let config = RagConfig::load(&config_path)?;
+
+    // Optionally restrict to a subset by name (`--only akamai`).
+    if let Some(missing) = only
+        .iter()
+        .find(|name| !config.indexes.iter().any(|e| &e.name == *name))
+    {
+        anyhow::bail!(
+            "--only names an index not in {}: {:?}",
+            config_path.display(),
+            missing
+        );
+    }
+    let selected: Vec<&config::IndexEntry> = config
+        .indexes
+        .iter()
+        .filter(|e| only.is_empty() || only.iter().any(|n| n == &e.name))
+        .collect();
+
+    eprintln!(
+        "Building {} index(es) from {}",
+        selected.len(),
+        config_path.display()
+    );
+
+    let total = selected.len();
+    for (i, entry) in selected.iter().enumerate() {
+        let index_path = base.join(&entry.path);
+        let output = entry
+            .output
+            .clone()
+            .unwrap_or_else(|| base.join(".rag").join(&entry.name));
+
+        let model = entry
+            .model
+            .clone()
+            .or_else(|| config.model.clone())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let chunk_size = entry
+            .chunk_size
+            .or(config.chunk_size)
+            .unwrap_or(DEFAULT_CHUNK_SIZE);
+        let chunk_overlap = entry
+            .chunk_overlap
+            .or(config.chunk_overlap)
+            .unwrap_or(DEFAULT_CHUNK_OVERLAP);
+
+        let discovery = DiscoveryConfig {
+            extra_extensions: entry.extensions.clone(),
+            exclude: entry.exclude.clone(),
+            include: entry.include.clone(),
+        };
+
+        eprintln!();
+        eprintln!("[{}/{}] {} → {}", i + 1, total, entry.name, output.display());
+
+        cmd_index(
+            &index_path,
+            Some(&output),
+            &model,
+            chunk_size,
+            chunk_overlap,
+            &discovery,
+            cache_dir,
+        )
+        .with_context(|| format!("Failed to build index {:?}", entry.name))?;
+    }
 
     Ok(())
 }

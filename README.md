@@ -38,10 +38,11 @@ Prebuilt binaries are published for macOS ARM64, macOS x86_64, Linux x86_64, Lin
 
 ## Commands
 
-### `rag index <path>`
+### `rag index [path]`
 
-Recursively discovers text files under `<path>`, chunks them, computes
-embeddings, and writes the index to disk.
+With a `<path>`, recursively discovers text files under it, chunks them,
+computes embeddings, and writes the index to disk. With **no path**, reads a
+[config file](#config-file-ragtoml) and builds every index it declares.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -49,11 +50,53 @@ embeddings, and writes the index to disk.
 | `-m, --model <id>` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model ID |
 | `--chunk-size <n>` | `512` | Chunk size in characters |
 | `--chunk-overlap <n>` | `64` | Overlap between consecutive chunks |
+| `--ext <list>` | — | Extra file extensions to index, beyond the built-in allowlist (comma-separated or repeated), e.g. `--ext mdx,rst` |
+| `--exclude <list>` | — | Directory/file specs to skip (comma-separated or repeated) |
+| `--include <list>` | — | Normally-skipped directories to index anyway, e.g. `--include dist` |
+| `-c, --config <file>` | `rag.toml` | Config file to build from when no path is given |
+| `--only <list>` | — | In config mode, build only these named indexes (skip slow ones you didn't change) |
+
+An `--exclude`/`--include` spec without a `/` matches any path component by
+name (e.g. `changelog` skips every `changelog/` directory). A spec containing a
+`/` is treated as a relative-path prefix (e.g. `src/content/changelog` skips
+only that one). `--include` re-enables directories that are skipped by default
+(`node_modules`, `dist`, `build`, `vendor`, `target`, hidden dirs, …).
 
 Re-running `rag index` on the same directory performs **incremental indexing** —
 only changed or new files are re-embedded. File changes are detected using
 [blake3](https://github.com/BLAKE3-team/BLAKE3) content hashes. If you change
 the model or chunk settings the entire index is rebuilt automatically.
+
+#### Config file (`rag.toml`)
+
+To build a whole set of indexes with one command — instead of a shell script
+that calls `rag index` once per directory — declare them in a `rag.toml` and run
+`rag index` with no path. Global keys at the top are defaults; each `[[index]]`
+may override them. Paths and output dirs are resolved relative to the config
+file.
+
+```toml
+# Global defaults (all optional)
+model = "sentence-transformers/all-MiniLM-L6-v2"
+chunk_size = 512
+chunk_overlap = 64
+
+[[index]]
+name = "docs"                  # output defaults to .rag/<name>
+path = "docs/src/content"      # relative to this config file
+extensions = ["mdx"]           # extra extensions beyond the built-in allowlist
+exclude = ["changelog"]        # skip these dirs/files
+# include = ["dist"]           # re-include normally-skipped dirs
+# output = ".rag/docs"         # override the default output dir
+
+[[index]]
+name = "reference"
+path = "reference/md"
+```
+
+`rag index` looks for `rag.toml` then `.rag.toml` in the current directory, or
+use `--config <file>`. To rebuild just some of the declared indexes, use
+`--only`: `rag index --only docs`.
 
 ### `rag search <query>`
 
@@ -135,8 +178,12 @@ etc.), `.json`, `.yaml`/`.yml`, and `.css`/`.scss` are intentionally **not**
 indexed — they tend to drown out useful matches with boilerplate. Index your
 code with a code-aware tool instead.
 
+To index an extension that isn't in the allowlist (for example `.mdx`), add it
+with `--ext` (or an entry's `extensions` in `rag.toml`): `rag index ./docs --ext mdx`.
+
 Hidden directories, `node_modules`, `target`, `__pycache__`, `vendor`, `dist`,
-and `build` are skipped automatically.
+and `build` are skipped automatically. Skip more with `--exclude`, or force a
+skipped directory back in with `--include`.
 
 ## How it works
 
