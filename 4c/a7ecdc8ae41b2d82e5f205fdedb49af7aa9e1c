@@ -1,0 +1,27 @@
+Cargo.lock
+  s_ebfbd57ed3be3d::t_01f0d87b18decf 1835,2113-2121,2296-2336,2724-2732
+Cargo.toml
+  s_ebfbd57ed3be3d::t_b511276143abd6 42
+README.md
+  s_ebfbd57ed3be3d::t_8c5b9885278e6b 41,43-45,53-63,70-100,181-183,185-186
+src/ingest.rs
+  s_ebfbd57ed3be3d::t_9f436ef3045018 3,44-55,74-118,130-137,140-146,152-159,161-171,173-175,191,339-381
+src/lib.rs
+  s_ebfbd57ed3be3d::t_26a1fde6eff139 1,8,13,19,41-45,47-58,75-89,150-151,156-194,262,267,284,358-454
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4ca7ecdc8ae41b2d82e5f205fdedb49af7aa9e1c",
+  "prompts": {},
+  "sessions": {
+    "s_ebfbd57ed3be3d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0987120a7ffeZfMjURQidXzvjQ",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Mathew Jacob <mathew@cloudflare.com>"
+    }
+  }
+}
