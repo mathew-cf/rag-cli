@@ -43,9 +43,9 @@ edition = "2021"
 });
 
 test("parseCargoVersion prefers the first declaration when there are multiple", () => {
-  // `rag-cli-cuda/Cargo.toml` repeats the version; the root Cargo.toml
-  // is authoritative — we assert we pick the first line, as the real
-  // prepare script only reads the top-level file.
+  // A Cargo.toml can repeat `version` in later sections; the top-level
+  // [package] version is authoritative — we assert we pick the first line,
+  // as the real prepare script only reads the top-level file.
   const toml = `[package]
 version = "0.5.0"
 [other]

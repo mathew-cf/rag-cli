@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::config::RagConfig;
 use crate::embed::{
-    download_model, model_file_list, model_files_present, resolve_hf_cache, select_device,
+    download_model, embedding_backend, model_file_list, model_files_present, resolve_hf_cache,
     EmbeddingEngine, DEFAULT_MODEL,
 };
 use crate::index::{search_top_k, ChunkRecord, Index, IndexMeta};
@@ -242,8 +242,7 @@ fn cmd_download(
 
     if verify {
         eprintln!("Verifying model loads and produces embeddings...");
-        let device = select_device()?;
-        let engine = EmbeddingEngine::load(Some(model_id), &device, cache_dir)?;
+        let mut engine = EmbeddingEngine::load(Some(model_id), cache_dir)?;
         let vec = engine.embed_one("hello world")?;
         if vec.is_empty() {
             anyhow::bail!("Model produced an empty embedding — installation may be corrupt");
@@ -293,9 +292,8 @@ fn cmd_index(
     // 2. Try incremental indexing against an existing index
     let prev_index = Index::load(&index_dir).ok();
     let can_reuse = prev_index.as_ref().is_some_and(|prev| {
-        prev.meta.model_id == model_id
-            && prev.meta.chunk_size == chunk_size
-            && prev.meta.chunk_overlap == chunk_overlap
+        prev.meta
+            .reusable_for(model_id, embedding_backend(), chunk_size, chunk_overlap)
     });
 
     let (chunks, file_hashes, hidden_size) = if can_reuse {
@@ -332,6 +330,7 @@ fn cmd_index(
     // 3. Save index
     let meta = IndexMeta {
         model_id: model_id.to_string(),
+        embedding_backend: embedding_backend().to_string(),
         hidden_size,
         num_chunks: chunks.len(),
         root_dir: root.to_string_lossy().to_string(),
@@ -471,8 +470,7 @@ fn full_index(
     }
 
     eprintln!("Embedding {} chunks...", all_chunks.len());
-    let device = select_device()?;
-    let engine = EmbeddingEngine::load(Some(model_id), &device, cache_dir)?;
+    let mut engine = EmbeddingEngine::load(Some(model_id), cache_dir)?;
     let hidden_size = engine.hidden_size();
 
     let texts: Vec<String> = all_chunks.iter().map(|c| c.text.clone()).collect();
@@ -566,8 +564,7 @@ fn incremental_index(
 
         if !new_text_chunks.is_empty() {
             eprintln!("Embedding {} new/changed chunks...", new_text_chunks.len());
-            let device = select_device()?;
-            let engine = EmbeddingEngine::load(Some(model_id), &device, cache_dir)?;
+            let mut engine = EmbeddingEngine::load(Some(model_id), cache_dir)?;
             let hs = engine.hidden_size();
 
             let texts: Vec<String> = new_text_chunks.iter().map(|c| c.text.clone()).collect();
@@ -631,8 +628,7 @@ fn cmd_search(
     let model_id = model_override.unwrap_or(&index.meta.model_id);
 
     // Load model and embed the query
-    let device = select_device()?;
-    let engine = EmbeddingEngine::load(Some(model_id), &device, cache_dir)?;
+    let mut engine = EmbeddingEngine::load(Some(model_id), cache_dir)?;
     let query_embedding = engine.embed_one(query)?;
 
     let embed_time = start.elapsed();

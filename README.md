@@ -2,7 +2,7 @@
 
 Local-first semantic search over your files. Index a directory and query it
 with natural language — all embeddings are computed on your machine using
-[candle](https://github.com/huggingface/candle), with no external API calls.
+[ONNX Runtime](https://onnxruntime.ai/), with no external API calls.
 
 ## Quick start
 
@@ -120,19 +120,17 @@ Prints index metadata: model, chunk count, source file count, index size, etc.
 
 ## Hardware acceleration
 
-On macOS, Metal GPU and Accelerate BLAS are enabled automatically.
+Inference runs on [ONNX Runtime](https://onnxruntime.ai/) using the CPU
+execution provider with an int8-quantized model. For a model this small,
+int8-on-CPU is the fastest option available — roughly 2x the throughput of
+fp32 at ~99.7% of the quality, and faster than GPU execution (small models are
+dominated by per-kernel dispatch overhead, and int8 has no GPU fast path). No
+GPU, CUDA toolkit, or extra flags are needed.
 
-For NVIDIA GPUs, install the CUDA build:
-
-```
-cargo install rag-cli-cuda
-```
-
-This requires the CUDA toolkit to be installed on your system. The binary name
-is the same (`rag`), so it's a drop-in replacement.
-
-On other platforms the default build falls back to CPU — no extra flags are
-needed.
+The quantized weights are architecture-specific and selected automatically:
+arm64 (Apple Silicon, ARM servers) and x86-64 (AVX2) each get a tuned build.
+The ONNX Runtime library is statically linked into the binary, so there's
+nothing to install separately.
 
 ## Model management
 

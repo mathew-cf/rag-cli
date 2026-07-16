@@ -1,11 +1,8 @@
-[workspace]
-members = [".", "rag-cli-cuda"]
-
 [package]
 name = "rag-cli"
 version = "0.6.1"
 edition = "2021"
-description = "Local-first RAG CLI powered by candle for semantic search over your files"
+description = "Local-first RAG CLI powered by ONNX Runtime for semantic search over your files"
 license = "Apache-2.0"
 repository = "https://github.com/mathew-cf/rag-cli"
 
@@ -17,20 +14,14 @@ path = "src/lib.rs"
 name = "rag"
 path = "src/main.rs"
 
-[features]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-
 [dependencies]
-# ML framework
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
+# Inference: ONNX Runtime (CPU, statically linked via download-binaries).
+ort = "=2.0.0-rc.10"
 
-# Model download + loading
+# Model download + tokenization
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-safetensors = "0.7"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -48,8 +39,3 @@ blake3 = "1"
 anyhow = "1"
 indicatif = "0.17"
 walkdir = "2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.9", features = ["metal", "accelerate"] }
-candle-nn = { version = "0.9", features = ["metal", "accelerate"] }
-candle-transformers = { version = "0.9", features = ["metal", "accelerate"] }

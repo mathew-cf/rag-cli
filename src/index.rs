@@ -21,6 +21,13 @@ pub struct ChunkRecord {
 pub struct IndexMeta {
     /// Model used to generate embeddings.
     pub model_id: String,
+    /// Inference backend/precision that produced the vectors (e.g.
+    /// `onnx-qint8-arm64`). Vectors from different backends are not
+    /// interchangeable, so a change here forces a full re-index. Defaults to
+    /// empty for indexes built before this field existed, which likewise
+    /// triggers a rebuild on next `rag index`.
+    #[serde(default)]
+    pub embedding_backend: String,
     /// Embedding dimensionality.
     pub hidden_size: usize,
     /// Number of chunks.
@@ -37,6 +44,25 @@ pub struct IndexMeta {
     /// Used for incremental re-indexing.
     #[serde(default)]
     pub file_hashes: BTreeMap<String, String>,
+}
+
+impl IndexMeta {
+    /// Whether an existing index can be reused for an incremental re-index
+    /// instead of a full rebuild. All embedding-affecting settings must match:
+    /// the model, the inference backend/precision (fp32 and int8 vectors are
+    /// not interchangeable), and the chunking parameters.
+    pub fn reusable_for(
+        &self,
+        model_id: &str,
+        embedding_backend: &str,
+        chunk_size: usize,
+        chunk_overlap: usize,
+    ) -> bool {
+        self.model_id == model_id
+            && self.embedding_backend == embedding_backend
+            && self.chunk_size == chunk_size
+            && self.chunk_overlap == chunk_overlap
+    }
 }
 
 /// The full on-disk index: metadata + all chunk records.
@@ -120,4 +146,62 @@ pub fn search_top_k<'a>(
     });
     scored.truncate(k);
     scored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta() -> IndexMeta {
+        IndexMeta {
+            model_id: "m".to_string(),
+            embedding_backend: "onnx-qint8-arm64".to_string(),
+            hidden_size: 384,
+            num_chunks: 0,
+            root_dir: "/tmp".to_string(),
+            created_at: "now".to_string(),
+            chunk_size: 512,
+            chunk_overlap: 64,
+            file_hashes: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn reusable_when_everything_matches() {
+        assert!(meta().reusable_for("m", "onnx-qint8-arm64", 512, 64));
+    }
+
+    #[test]
+    fn not_reusable_when_backend_differs() {
+        // The int8 -> different-backend switch must force a full re-index even
+        // though the model_id and chunking are unchanged.
+        assert!(!meta().reusable_for("m", "onnx-fp32", 512, 64));
+    }
+
+    #[test]
+    fn not_reusable_when_model_or_chunking_differs() {
+        let m = meta();
+        assert!(!m.reusable_for("other", "onnx-qint8-arm64", 512, 64));
+        assert!(!m.reusable_for("m", "onnx-qint8-arm64", 256, 64));
+        assert!(!m.reusable_for("m", "onnx-qint8-arm64", 512, 32));
+    }
+
+    #[test]
+    fn embedding_backend_defaults_to_empty_for_legacy_meta() {
+        // An index written before `embedding_backend` existed must deserialize
+        // with an empty backend, which then fails `reusable_for` against any
+        // real backend -> automatic full rebuild on upgrade.
+        let json = r#"{
+            "model_id": "m",
+            "hidden_size": 384,
+            "num_chunks": 0,
+            "root_dir": "/tmp",
+            "created_at": "now",
+            "chunk_size": 512,
+            "chunk_overlap": 64
+        }"#;
+        let parsed: IndexMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.embedding_backend, "");
+        assert!(!parsed.reusable_for("m", "onnx-qint8-arm64", 512, 64));
+    }
 }
