@@ -1,6 +1,6 @@
 [package]
 name = "rag-cli"
-version = "0.6.1"
+version = "1.0.0"
 edition = "2021"
 description = "Local-first RAG CLI powered by ONNX Runtime for semantic search over your files"
 license = "Apache-2.0"
