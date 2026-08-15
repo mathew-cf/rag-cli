@@ -88,7 +88,11 @@ fn normalize_extension(ext: &str) -> Option<String> {
 /// so `--ext .MDX` and `--ext mdx` are equivalent, and duplicates are harmless.
 pub fn build_extension_set(extra_extensions: &[String]) -> BTreeSet<String> {
     let mut set: BTreeSet<String> = TEXT_EXTENSIONS.iter().map(|e| e.to_string()).collect();
-    set.extend(extra_extensions.iter().filter_map(|e| normalize_extension(e)));
+    set.extend(
+        extra_extensions
+            .iter()
+            .filter_map(|e| normalize_extension(e)),
+    );
     set
 }
 
@@ -361,7 +365,11 @@ mod tests {
     #[test]
     fn test_matches_spec_by_name() {
         // bare spec matches a path component by name, anywhere in the tree
-        assert!(matches_spec("deprecated", "reference/deprecated", "deprecated"));
+        assert!(matches_spec(
+            "deprecated",
+            "reference/deprecated",
+            "deprecated"
+        ));
         assert!(matches_spec("dist", "dist", "dist"));
         assert!(!matches_spec("dist", "src/content", "content"));
     }
@@ -369,13 +377,21 @@ mod tests {
     #[test]
     fn test_matches_spec_by_path_prefix() {
         // spec with a slash is a relative-path prefix
-        assert!(matches_spec("src/content/changelog", "src/content/changelog", "changelog"));
+        assert!(matches_spec(
+            "src/content/changelog",
+            "src/content/changelog",
+            "changelog"
+        ));
         assert!(matches_spec(
             "src/content/changelog",
             "src/content/changelog/2024.md",
             "2024.md"
         ));
-        assert!(!matches_spec("src/content/changelog", "src/content/other", "other"));
+        assert!(!matches_spec(
+            "src/content/changelog",
+            "src/content/other",
+            "other"
+        ));
         // leading/trailing slashes are tolerated
         assert!(matches_spec("/partials/", "partials", "partials"));
     }

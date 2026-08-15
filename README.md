@@ -2,7 +2,7 @@
 
 Local-first semantic search over your files. Index a directory and query it
 with natural language — all embeddings are computed on your machine using
-[ONNX Runtime](https://onnxruntime.ai/), with no external API calls.
+native CoreML or [ONNX Runtime](https://onnxruntime.ai/), with no external API calls.
 
 ## Quick start
 
@@ -65,7 +65,11 @@ only that one). `--include` re-enables directories that are skipped by default
 Re-running `rag index` on the same directory performs **incremental indexing** —
 only changed or new files are re-embedded. File changes are detected using
 [blake3](https://github.com/BLAKE3-team/BLAKE3) content hashes. If you change
-the model or chunk settings the entire index is rebuilt automatically.
+the model or chunk settings — or when a rag-cli upgrade changes the embedding
+backend/precision or on-disk format — the entire index is rebuilt automatically.
+A no-change run checks the small metadata file and does not load or rewrite the
+full index. Changed files reuse embeddings for chunk text already present in the
+index.
 
 #### Config file (`rag.toml`)
 
@@ -98,21 +102,61 @@ path = "reference/md"
 use `--config <file>`. To rebuild just some of the declared indexes, use
 `--only`: `rag index --only docs`.
 
+Indexes can live in the root repository while their source directories are Git
+submodules. This keeps generated data out of the submodules and lets each corpus
+update independently:
+
+```toml
+[[index]]
+name = "vendor-docs"
+path = "vendor/docs"          # submodule
+output = ".rag/vendor-docs"   # root-repository index
+```
+
+The same config can be searched as a federation with one query embedding:
+
+```bash
+rag search "cache behavior" --config rag.toml
+rag search "cache behavior" --config rag.toml --only docs,reference
+```
+
 ### `rag search <query>`
 
 Embeds your query and returns the most similar chunks by cosine similarity.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i, --index <dir>` | `.rag` | Index directory to search |
-| `-k, --top-k <n>` | `5` | Number of results |
-| `-m, --model <id>` | *(from index)* | Override embedding model |
+| `-i, --index <dir>` | `.rag` | Index directory to search; repeat to federate several indexes |
+| `-c, --config <file>` | — | Search indexes declared by a `rag.toml` instead of `--index` |
+| `--only <list>` | — | With `--config`, search only these named indexes |
+| `-k, --top-k <n>` | `5` | Number of results across all indexes |
+| `-m, --model <id>` | *(from index)* | Override embedding model; must match the indexes |
 | `--full` | off | Show full chunk text instead of truncated preview |
 | `--json` | off | Output compact JSON (for piping to LLMs or other tools) |
 
+Repeat `--index` to search existing indexes without merging or rebuilding them:
+
+```bash
+rag search "cache behavior" \
+  -i .rag/product-docs \
+  -i .rag/api-reference \
+  -i .rag/examples
+```
+
+Federated indexes must use the same model and embedding dimensions. They are
+loaded and searched sequentially, keeping peak memory near the largest index
+rather than the sum of all indexes. Each index contributes its local top-k, then
+rag-cli computes the global top-k. Exact-text deduplication remains per-index;
+identical text stored in different indexes may appear more than once.
+
+Federated JSON results retain `source`, `score`, `byte_offset`, and `text`, and
+also include `index`, `root_dir`, and (for config entries) `index_name`. These
+fields let callers resolve a relative source path against the correct corpus.
+
 ### `rag info`
 
-Prints index metadata: model, chunk count, source file count, index size, etc.
+Prints index metadata: format, model, chunk and unique-text counts, duplicate
+count, source file count, index size, etc.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -120,17 +164,19 @@ Prints index metadata: model, chunk count, source file count, index size, etc.
 
 ## Hardware acceleration
 
-Inference runs on [ONNX Runtime](https://onnxruntime.ai/) using the CPU
-execution provider with an int8-quantized model. For a model this small,
-int8-on-CPU is the fastest option available — roughly 2x the throughput of
-fp32 at ~99.7% of the quality, and faster than GPU execution (small models are
-dominated by per-kernel dispatch overhead, and int8 has no GPU fast path). No
-GPU, CUDA toolkit, or extra flags are needed.
+Apple Silicon builds use a native FP16 CoreML model with pooling and normalization
+fused into the compiled graph. Other platforms use [ONNX Runtime](https://onnxruntime.ai/)
+on CPU with architecture-tuned int8 weights. The backend is selected at build
+time; no GPU toolkit or runtime flags are required.
 
-The quantized weights are architecture-specific and selected automatically:
-arm64 (Apple Silicon, ARM servers) and x86-64 (AVX2) each get a tuned build.
-The ONNX Runtime library is statically linked into the binary, so there's
-nothing to install separately.
+On Apple Silicon, native CoreML substantially reduces indexing time and memory
+compared with the int8 ONNX path. The downloaded CoreML artifact is pinned to an
+immutable Hugging Face revision. The ONNX Runtime library remains statically
+linked for non-Apple builds, so there is nothing to install separately.
+
+Persisted vectors use F16 independently of int8 model inference. Exact duplicate
+chunk text is embedded and stored once, while compact occurrence records retain
+every source and byte offset. Search decodes F16 values for exact cosine scoring.
 
 ## Model management
 
@@ -141,6 +187,10 @@ certificate store and does not respect the system root CA certificates. That
 makes it fail in environments with custom CA roots (corporate proxies, internal
 TLS inspection, etc.). rag-cli uses `native-tls`, which delegates to the OS certificate store,
 so it works in those environments without extra configuration.
+
+The native CoreML backend on Apple Silicon currently supports the default MiniLM model only.
+Non-Apple ONNX builds retain model overrides when the requested repository
+publishes the expected architecture-specific ONNX artifact.
 
 You can control the cache location:
 
@@ -188,13 +238,13 @@ skipped directory back in with `--include`.
 1. **Discover** text files recursively, skipping binary and vendored content
 2. **Chunk** each file into overlapping segments (~512 chars), breaking at
    paragraph or line boundaries when possible
-3. **Embed** chunks in batches of 64 using a BERT model
-   (`all-MiniLM-L6-v2`, 384-dimensional vectors) with mean pooling and L2
-   normalization
-4. **Store** the index as a bincode-serialized file (`.rag/index.bin`) with
-   JSON metadata (`.rag/meta.json`)
-5. **Search** by embedding the query with the same model and ranking chunks
-   by cosine similarity (dot product on normalized vectors)
+3. **Deduplicate and embed** each unique chunk body once, in batches of 128,
+   using `all-MiniLM-L6-v2` with mean pooling and L2 normalization
+4. **Store** one F16 vector and one text body per unique chunk, plus compact
+   source/offset occurrence records, in `.rag/index.bin`; inference remains
+   int8 with f32 output, so F16 applies only to persisted vectors
+5. **Search** by embedding the query with the same model and ranking unique
+   chunk bodies by exact cosine similarity
 
 ## License
 

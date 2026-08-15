@@ -1,37 +1,89 @@
 use anyhow::{Context, Result};
+use half::{f16, prelude::HalfFloatVecExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-/// A single chunk of text with its embedding and source metadata.
+pub const INDEX_FORMAT_VERSION: u32 = 2;
+
+/// A source file referenced by one or more chunk occurrences.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChunkRecord {
-    /// Source file path (relative to indexed directory).
-    pub source: String,
-    /// Byte offset of this chunk within the source file.
-    pub byte_offset: usize,
-    /// The chunk text.
+pub struct SourceRecord {
+    pub path: String,
+}
+
+/// One unique chunk body and its embedding.
+///
+/// Embeddings are stored as IEEE-754 binary16 bits. Inference still produces
+/// f32 vectors; only the persisted representation is quantized.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TextRecord {
     pub text: String,
-    /// Precomputed embedding vector (L2 normalized).
-    pub embedding: Vec<f32>,
+    pub embedding_f16: Vec<u16>,
+    /// L2 norm after decoding the stored F16 values, used for exact cosine.
+    pub embedding_norm: f32,
+}
+
+impl TextRecord {
+    pub fn new(text: String, embedding: Vec<f32>) -> Self {
+        let half_values: Vec<f16> = Vec::from_f32_slice(&embedding);
+        let embedding_norm = half_values
+            .iter()
+            .map(|value| {
+                let value = value.to_f32();
+                value * value
+            })
+            .sum::<f32>()
+            .sqrt();
+        let embedding_f16 = half_values.reinterpret_into();
+        Self {
+            text,
+            embedding_f16,
+            embedding_norm,
+        }
+    }
+
+    pub fn without_embedding(text: String) -> Self {
+        Self {
+            text,
+            embedding_f16: Vec::new(),
+            embedding_norm: 0.0,
+        }
+    }
+
+    pub fn set_embedding(&mut self, embedding: Vec<f32>) {
+        let replacement = Self::new(std::mem::take(&mut self.text), embedding);
+        *self = replacement;
+    }
+}
+
+/// A source location at which a unique chunk body occurs.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChunkOccurrence {
+    pub source_id: u32,
+    pub text_id: u32,
+    pub byte_offset: usize,
 }
 
 /// Metadata stored alongside the index.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IndexMeta {
+    /// On-disk schema version. A mismatch forces a full rebuild.
+    #[serde(default)]
+    pub format_version: u32,
     /// Model used to generate embeddings.
     pub model_id: String,
-    /// Inference backend/precision that produced the vectors (e.g.
-    /// `onnx-qint8-arm64`). Vectors from different backends are not
-    /// interchangeable, so a change here forces a full re-index. Defaults to
-    /// empty for indexes built before this field existed, which likewise
-    /// triggers a rebuild on next `rag index`.
+    /// Inference backend/precision that produced the vectors.
     #[serde(default)]
     pub embedding_backend: String,
     /// Embedding dimensionality.
     pub hidden_size: usize,
-    /// Number of chunks.
+    /// Number of source occurrences, including duplicate chunk text.
     pub num_chunks: usize,
+    /// Number of unique chunk bodies and stored vectors.
+    #[serde(default)]
+    pub num_unique_texts: usize,
     /// Root directory that was indexed.
     pub root_dir: String,
     /// Timestamp of index creation.
@@ -41,16 +93,12 @@ pub struct IndexMeta {
     /// Chunk overlap in characters.
     pub chunk_overlap: usize,
     /// Blake3 content hash per source file (relative path -> hex hash).
-    /// Used for incremental re-indexing.
     #[serde(default)]
     pub file_hashes: BTreeMap<String, String>,
 }
 
 impl IndexMeta {
-    /// Whether an existing index can be reused for an incremental re-index
-    /// instead of a full rebuild. All embedding-affecting settings must match:
-    /// the model, the inference backend/precision (fp32 and int8 vectors are
-    /// not interchangeable), and the chunking parameters.
+    /// Whether an existing index can be reused for an incremental re-index.
     pub fn reusable_for(
         &self,
         model_id: &str,
@@ -58,23 +106,36 @@ impl IndexMeta {
         chunk_size: usize,
         chunk_overlap: usize,
     ) -> bool {
-        self.model_id == model_id
+        self.format_version == INDEX_FORMAT_VERSION
+            && self.model_id == model_id
             && self.embedding_backend == embedding_backend
             && self.chunk_size == chunk_size
             && self.chunk_overlap == chunk_overlap
     }
 }
 
-/// The full on-disk index: metadata + all chunk records.
+/// Storage-v2 index: unique text/vectors are separate from source occurrences.
 #[derive(Serialize, Deserialize)]
 pub struct Index {
     pub meta: IndexMeta,
-    pub chunks: Vec<ChunkRecord>,
+    pub sources: Vec<SourceRecord>,
+    pub texts: Vec<TextRecord>,
+    pub occurrences: Vec<ChunkOccurrence>,
 }
 
 impl Index {
-    pub fn new(meta: IndexMeta, chunks: Vec<ChunkRecord>) -> Self {
-        Self { meta, chunks }
+    pub fn new(
+        meta: IndexMeta,
+        sources: Vec<SourceRecord>,
+        texts: Vec<TextRecord>,
+        occurrences: Vec<ChunkOccurrence>,
+    ) -> Self {
+        Self {
+            meta,
+            sources,
+            texts,
+            occurrences,
+        }
     }
 
     /// Save index to a directory (creates `index.bin` and `meta.json`).
@@ -88,63 +149,110 @@ impl Index {
             .with_context(|| format!("Failed to write {}", meta_path.display()))?;
 
         let index_path = dir.join("index.bin");
-        let encoded = bincode::serialize(self).context("Failed to serialize index")?;
-        std::fs::write(&index_path, encoded)
+        let file = std::fs::File::create(&index_path)
+            .with_context(|| format!("Failed to create {}", index_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        bincode::serialize_into(&mut writer, self)
             .with_context(|| format!("Failed to write {}", index_path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("Failed to flush {}", index_path.display()))?;
 
         Ok(())
+    }
+
+    /// Load only index metadata, without materializing the vector index.
+    pub fn load_meta(dir: &Path) -> Result<IndexMeta> {
+        let meta_path = dir.join("meta.json");
+        let file = std::fs::File::open(&meta_path)
+            .with_context(|| format!("Failed to open {}", meta_path.display()))?;
+        serde_json::from_reader(BufReader::new(file))
+            .with_context(|| format!("Failed to deserialize {}", meta_path.display()))
     }
 
     /// Load index from a directory.
     pub fn load(dir: &Path) -> Result<Self> {
         let index_path = dir.join("index.bin");
-        let data = std::fs::read(&index_path)
-            .with_context(|| format!("Failed to read {}", index_path.display()))?;
-        let index: Self = bincode::deserialize(&data)
+        let file = std::fs::File::open(&index_path)
+            .with_context(|| format!("Failed to open {}", index_path.display()))?;
+        let index: Self = bincode::deserialize_from(BufReader::new(file))
             .context("Failed to deserialize index (corrupted or version mismatch?)")?;
         Ok(index)
     }
 
-    /// Default index directory.
     pub fn default_dir() -> PathBuf {
         PathBuf::from(".rag")
     }
 }
 
-/// Compute cosine similarity between two L2-normalized vectors.
-/// Since both are normalized, this is just the dot product.
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+/// Exact cosine similarity between an f32 query and an F16-stored vector.
+///
+/// The query must already be L2-normalized. Embedding backends enforce this
+/// before search, while `stored_norm` accounts for F16 conversion error.
+pub fn cosine_similarity_f16(query: &[f32], stored: &[u16], stored_norm: f32) -> f32 {
+    if stored_norm == 0.0 {
+        return 0.0;
+    }
+    query
+        .iter()
+        .zip(stored)
+        .map(|(&a, &bits)| a * f16::from_bits(bits).to_f32())
+        .sum::<f32>()
+        / stored_norm
 }
 
-/// Search result with score and chunk reference.
 #[derive(Debug)]
 pub struct SearchResult<'a> {
     pub score: f32,
-    pub chunk: &'a ChunkRecord,
+    pub text_id: usize,
+    pub text: &'a TextRecord,
 }
 
-/// Find the top-k most similar chunks to the query embedding.
+/// Find the top-k unique chunk bodies. Source occurrences are resolved by the
+/// caller so repeated boilerplate cannot consume multiple result slots.
 pub fn search_top_k<'a>(
     query_embedding: &[f32],
-    chunks: &'a [ChunkRecord],
+    texts: &'a [TextRecord],
     k: usize,
 ) -> Vec<SearchResult<'a>> {
-    let mut scored: Vec<SearchResult<'a>> = chunks
+    if k == 0 || texts.is_empty() {
+        return Vec::new();
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let query_norm = query_embedding
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        debug_assert!(
+            (query_norm - 1.0).abs() < 1e-3,
+            "search query must be L2-normalized, got norm {query_norm}"
+        );
+    }
+
+    let mut scored: Vec<SearchResult<'a>> = texts
         .iter()
-        .map(|chunk| SearchResult {
-            score: cosine_similarity(query_embedding, &chunk.embedding),
-            chunk,
+        .enumerate()
+        .map(|(text_id, text)| SearchResult {
+            score: cosine_similarity_f16(query_embedding, &text.embedding_f16, text.embedding_norm),
+            text_id,
+            text,
         })
         .collect();
 
-    // Sort descending by score
-    scored.sort_by(|a, b| {
+    let by_score_desc = |a: &SearchResult<'_>, b: &SearchResult<'_>| {
         b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    scored.truncate(k);
+            .total_cmp(&a.score)
+            .then_with(|| a.text_id.cmp(&b.text_id))
+    };
+
+    if scored.len() > k {
+        scored.select_nth_unstable_by(k, by_score_desc);
+        scored.truncate(k);
+    }
+    scored.sort_by(by_score_desc);
     scored
 }
 
@@ -154,10 +262,12 @@ mod tests {
 
     fn meta() -> IndexMeta {
         IndexMeta {
+            format_version: INDEX_FORMAT_VERSION,
             model_id: "m".to_string(),
             embedding_backend: "onnx-qint8-arm64".to_string(),
-            hidden_size: 384,
+            hidden_size: 2,
             num_chunks: 0,
+            num_unique_texts: 0,
             root_dir: "/tmp".to_string(),
             created_at: "now".to_string(),
             chunk_size: 512,
@@ -172,25 +282,51 @@ mod tests {
     }
 
     #[test]
-    fn not_reusable_when_backend_differs() {
-        // The int8 -> different-backend switch must force a full re-index even
-        // though the model_id and chunking are unchanged.
-        assert!(!meta().reusable_for("m", "onnx-fp32", 512, 64));
-    }
+    fn not_reusable_when_format_backend_model_or_chunking_differs() {
+        let mut m = meta();
+        m.format_version = 1;
+        assert!(!m.reusable_for("m", "onnx-qint8-arm64", 512, 64));
 
-    #[test]
-    fn not_reusable_when_model_or_chunking_differs() {
         let m = meta();
+        assert!(!m.reusable_for("m", "onnx-fp32", 512, 64));
         assert!(!m.reusable_for("other", "onnx-qint8-arm64", 512, 64));
         assert!(!m.reusable_for("m", "onnx-qint8-arm64", 256, 64));
         assert!(!m.reusable_for("m", "onnx-qint8-arm64", 512, 32));
     }
 
     #[test]
-    fn embedding_backend_defaults_to_empty_for_legacy_meta() {
-        // An index written before `embedding_backend` existed must deserialize
-        // with an empty backend, which then fails `reusable_for` against any
-        // real backend -> automatic full rebuild on upgrade.
+    fn f16_record_preserves_cosine_order_and_norm() {
+        let high = TextRecord::new("high".into(), vec![1.0, 0.0]);
+        let low = TextRecord::new("low".into(), vec![0.0, 1.0]);
+        let texts = vec![low, high];
+        let results = search_top_k(&[1.0, 0.0], &texts, 2);
+
+        assert_eq!(results[0].text.text, "high");
+        assert!((results[0].score - 1.0).abs() < 1e-5);
+        assert_eq!(results[1].text.text, "low");
+    }
+
+    #[test]
+    fn top_k_handles_zero_and_k_larger_than_corpus() {
+        let texts = vec![TextRecord::new("only".into(), vec![1.0])];
+        assert!(search_top_k(&[1.0], &texts, 0).is_empty());
+        assert_eq!(search_top_k(&[1.0], &texts, 10).len(), 1);
+    }
+
+    #[test]
+    fn top_k_breaks_equal_score_ties_by_text_id() {
+        let texts = vec![
+            TextRecord::new("first".into(), vec![1.0]),
+            TextRecord::new("second".into(), vec![1.0]),
+        ];
+        let results = search_top_k(&[1.0], &texts, 1);
+
+        assert_eq!(results[0].text_id, 0);
+        assert_eq!(results[0].text.text, "first");
+    }
+
+    #[test]
+    fn legacy_metadata_forces_rebuild() {
         let json = r#"{
             "model_id": "m",
             "hidden_size": 384,
@@ -201,6 +337,7 @@ mod tests {
             "chunk_overlap": 64
         }"#;
         let parsed: IndexMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.format_version, 0);
         assert_eq!(parsed.embedding_backend, "");
         assert!(!parsed.reusable_for("m", "onnx-qint8-arm64", 512, 64));
     }
