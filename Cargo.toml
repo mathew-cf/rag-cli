@@ -18,9 +18,6 @@ path = "src/main.rs"
 # Inference: ONNX Runtime (CPU, statically linked via download-binaries).
 ort = "=2.0.0-rc.10"
 
-[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-coreml-native = "=0.2.0"
-
 # Model download + tokenization
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
@@ -43,3 +40,6 @@ blake3 = "1"
 anyhow = "1"
 indicatif = "0.17"
 walkdir = "2"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+coreml-native = "=0.2.0"
