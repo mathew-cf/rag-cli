@@ -26,7 +26,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build
         run: cargo build --verbose
       - name: Run tests
@@ -36,10 +36,10 @@ jobs:
     name: npm package tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Run Node tests
         # Covers scripts/prepare-npm.js + npm/rag-cli/src/platform.js
         run: node --test test/npm-platform.test.js test/prepare-npm.test.js
@@ -56,7 +56,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -136,7 +136,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: main
 
@@ -159,14 +159,14 @@ jobs:
           fi
 
       - name: Upload to GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.publish.outputs.version }}
           files: dist/${{ matrix.release_artifact }}
 
       - name: Upload npm artifact
         if: matrix.npm_artifact != ''
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.npm_artifact }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
@@ -183,11 +183,11 @@ jobs:
       contents: read
       id-token: write # Required for npm trusted publishing + provenance
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: main
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           # npm trusted publishing requires npm 11.5.1+. Node 24 ships
           # with a recent enough npm; earlier LTS lines do not.
@@ -195,7 +195,7 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Download binary artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           # Artifact names line up with the PLATFORM_TARGETS keys used by
