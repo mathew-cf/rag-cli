@@ -24,6 +24,11 @@ const DEFAULT_CHUNK_SIZE: usize = 512;
 const DEFAULT_CHUNK_OVERLAP: usize = 64;
 const DEFAULT_TOP_K: usize = 5;
 
+struct IndexSource<'a> {
+    path: &'a Path,
+    metadata_root: &'a Path,
+}
+
 struct IndexBuildSettings<'a> {
     model_id: &'a str,
     chunk_size: usize,
@@ -198,7 +203,10 @@ pub fn run() -> Result<()> {
                     include,
                 };
                 cmd_index(
-                    &path,
+                    IndexSource {
+                        path: &path,
+                        metadata_root: &path,
+                    },
                     output.as_deref(),
                     &model,
                     chunk_size,
@@ -287,7 +295,7 @@ fn cmd_download(model_id: &str, verify: bool, cache_dir: Option<&std::path::Path
 }
 
 fn cmd_index(
-    path: &Path,
+    source: IndexSource<'_>,
     output: Option<&std::path::Path>,
     model_id: &str,
     chunk_size: usize,
@@ -297,15 +305,17 @@ fn cmd_index(
 ) -> Result<()> {
     let start = Instant::now();
 
-    let root = path
+    let root = source
+        .path
         .canonicalize()
-        .with_context(|| format!("Directory not found: {}", path.display()))?;
+        .with_context(|| format!("Directory not found: {}", source.path.display()))?;
 
     if !root.is_dir() {
         anyhow::bail!("{} is not a directory", root.display());
     }
 
     let index_dir = output.map(PathBuf::from).unwrap_or_else(Index::default_dir);
+    let metadata_root = normalized_metadata_path(source.metadata_root);
 
     // 1. Discover files and hash them
     eprintln!("Indexing: {}", root.display());
@@ -325,7 +335,7 @@ fn cmd_index(
     let prev_meta = Index::load_meta(&index_dir).ok();
     let can_reuse = had_previous
         && prev_meta.as_ref().is_some_and(|meta| {
-            meta.root_dir == root.to_string_lossy()
+            meta.root_dir == metadata_root
                 && meta.reusable_for(model_id, embedding_backend(), chunk_size, chunk_overlap)
         });
 
@@ -379,7 +389,7 @@ fn cmd_index(
         hidden_size,
         num_chunks: occurrences.len(),
         num_unique_texts: texts.len(),
-        root_dir: root.to_string_lossy().to_string(),
+        root_dir: metadata_root,
         created_at: chrono_now(),
         chunk_size,
         chunk_overlap,
@@ -489,7 +499,10 @@ fn cmd_index_from_config(
         );
 
         cmd_index(
-            &index_path,
+            IndexSource {
+                path: &index_path,
+                metadata_root: &entry.path,
+            },
             Some(&output),
             &model,
             chunk_size,
@@ -501,6 +514,20 @@ fn cmd_index_from_config(
     }
 
     Ok(())
+}
+
+/// Strip redundant `.` components without canonicalizing, so relative paths
+/// stay relative while meaningful `..` components and absolute roots remain.
+fn normalized_metadata_path(path: &Path) -> String {
+    let normalized: PathBuf = path
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect();
+    if normalized.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        normalized.to_string_lossy().to_string()
+    }
 }
 
 /// Build a stable list of unique texts and, for each input, the corresponding
@@ -1240,15 +1267,15 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_records, merge_federated_results, unique_text_plan, validate_search_metadata, Cli,
-        Commands, FederatedSearchResult, SearchIndexSpec,
+        compact_records, merge_federated_results, normalized_metadata_path, unique_text_plan,
+        validate_search_metadata, Cli, Commands, FederatedSearchResult, SearchIndexSpec,
     };
     use crate::index::{
-        ChunkOccurrence, IndexMeta, SourceRecord, TextRecord, INDEX_FORMAT_VERSION,
+        ChunkOccurrence, Index, IndexMeta, SourceRecord, TextRecord, INDEX_FORMAT_VERSION,
     };
     use clap::Parser;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn meta(model: &str, hidden_size: usize) -> IndexMeta {
         IndexMeta {
@@ -1368,6 +1395,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0.9, 0, 2), (0.9, 1, 1), (0.8, 1, 0)]
         );
+    }
+
+    #[test]
+    fn metadata_paths_remain_relative_and_drop_redundant_current_dir() {
+        assert_eq!(
+            normalized_metadata_path(Path::new("./docs/content")),
+            "docs/content"
+        );
+        assert_eq!(
+            normalized_metadata_path(Path::new("../shared/docs")),
+            "../shared/docs"
+        );
+        assert_eq!(normalized_metadata_path(Path::new(".")), ".");
+    }
+
+    #[test]
+    fn absolute_metadata_paths_remain_absolute() {
+        let path = if cfg!(windows) {
+            Path::new(r"C:\docs\content")
+        } else {
+            Path::new("/docs/content")
+        };
+        assert!(Path::new(&normalized_metadata_path(path)).is_absolute());
+    }
+
+    #[test]
+    fn relative_metadata_round_trip_remains_reusable() {
+        let metadata_root = normalized_metadata_path(Path::new("./docs/content"));
+        let mut metadata = meta("m", 2);
+        metadata.root_dir = metadata_root.clone();
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rag-cli-relative-metadata-{}-{suffix}",
+            std::process::id()
+        ));
+        Index::new(metadata, vec![], vec![], vec![])
+            .save(&dir)
+            .expect("relative metadata should save");
+        let loaded = Index::load_meta(&dir).expect("relative metadata should load");
+        std::fs::remove_dir_all(&dir).expect("temporary index should be removed");
+
+        let can_reuse = loaded.root_dir == metadata_root
+            && loaded.reusable_for("m", "coreml-native-fp16", 512, 64);
+        assert!(can_reuse, "relative metadata should permit index reuse");
     }
 
     #[test]

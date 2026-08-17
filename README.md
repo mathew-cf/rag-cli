@@ -77,7 +77,9 @@ To build a whole set of indexes with one command — instead of a shell script
 that calls `rag index` once per directory — declare them in a `rag.toml` and run
 `rag index` with no path. Global keys at the top are defaults; each `[[index]]`
 may override them. Paths and output dirs are resolved relative to the config
-file.
+file. Relative source paths remain relative in `meta.json` (and therefore in
+JSON search results), so committed indexes do not contain machine-specific
+absolute paths.
 
 ```toml
 # Global defaults (all optional)
@@ -152,6 +154,8 @@ identical text stored in different indexes may appear more than once.
 Federated JSON results retain `source`, `score`, `byte_offset`, and `text`, and
 also include `index`, `root_dir`, and (for config entries) `index_name`. These
 fields let callers resolve a relative source path against the correct corpus.
+When an index was built from a relative CLI or `rag.toml` path, `root_dir`
+preserves that relative path rather than exposing the builder's absolute path.
 
 ### `rag info`
 

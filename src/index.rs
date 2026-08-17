@@ -84,7 +84,8 @@ pub struct IndexMeta {
     /// Number of unique chunk bodies and stored vectors.
     #[serde(default)]
     pub num_unique_texts: usize,
-    /// Root directory that was indexed.
+    /// Root directory that was indexed. Relative CLI and config paths remain
+    /// relative so committed metadata is portable across machines.
     pub root_dir: String,
     /// Timestamp of index creation.
     pub created_at: String,
