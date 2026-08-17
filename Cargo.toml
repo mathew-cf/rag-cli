@@ -43,3 +43,5 @@ walkdir = "2"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 coreml-native = "=0.2.0"
+# Remove once coreml-native includes an autorelease pool in predict_batch().
+objc2 = "0.6"

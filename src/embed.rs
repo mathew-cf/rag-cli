@@ -513,7 +513,9 @@ impl EmbeddingEngine {
         let input_refs: Vec<&[(&str, &dyn AsMultiArray)]> =
             inputs.iter().map(Vec::as_slice).collect();
         let batch = BatchProvider::new(&input_refs)?;
-        let predictions = self.model.predict_batch(&batch)?;
+        // coreml-native 0.2.0 does not drain autoreleased CoreML batch
+        // outputs, eventually exhausting macOS's 16,384-IOSurface limit.
+        let predictions = objc2::rc::autoreleasepool(|_pool| self.model.predict_batch(&batch))?;
         (0..texts.len())
             .map(|i| {
                 let (embedding, shape) = predictions.get_f32(i, "div_1")?;

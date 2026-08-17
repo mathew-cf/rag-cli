@@ -1355,6 +1355,7 @@ dependencies = [
  "half",
  "indicatif",
  "native-tls",
+ "objc2",
  "ort",
  "serde",
  "serde_json",
