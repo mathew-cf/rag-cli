@@ -71,6 +71,7 @@ enum Commands {
     /// and builds every `[[index]]` it declares.
     Index {
         /// Directory to index. Omit to build every index in the config file.
+        #[arg(conflicts_with_all = ["config", "only"])]
         path: Option<PathBuf>,
 
         /// Config file to build from when no PATH is given
@@ -87,17 +88,17 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// HuggingFace model ID for embeddings.
-        #[arg(short, long, default_value = DEFAULT_MODEL)]
-        model: String,
+        /// HuggingFace model ID for embeddings (default: all-MiniLM-L6-v2).
+        #[arg(short, long)]
+        model: Option<String>,
 
-        /// Chunk size in characters.
-        #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
-        chunk_size: usize,
+        /// Chunk size in characters (default: 512).
+        #[arg(long)]
+        chunk_size: Option<usize>,
 
-        /// Chunk overlap in characters.
-        #[arg(long, default_value_t = DEFAULT_CHUNK_OVERLAP)]
-        chunk_overlap: usize,
+        /// Chunk overlap in characters (default: 64).
+        #[arg(long)]
+        chunk_overlap: Option<usize>,
 
         /// Extra file extensions to index, beyond the built-in allowlist
         /// (comma-separated or repeated), e.g. `--ext mdx,rst`.
@@ -120,16 +121,19 @@ enum Commands {
         /// The search query.
         query: String,
 
-        /// Index directories to search (repeatable; default: .rag).
+        /// Index directories to search (repeatable). When neither --index nor
+        /// --config is given, uses rag.toml/.rag.toml if present, then .rag.
         #[arg(short, long, conflicts_with = "config")]
         index: Vec<PathBuf>,
 
-        /// Search every index declared by this config file.
+        /// Search every index declared by this config file. When omitted,
+        /// rag.toml/.rag.toml is discovered automatically.
         #[arg(short = 'c', long, conflicts_with = "index")]
         config: Option<PathBuf>,
 
-        /// With --config, search only these named indexes (comma-separated or repeated).
-        #[arg(long, value_delimiter = ',', requires = "config")]
+        /// With an explicit or discovered config, search only these named indexes
+        /// (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',', conflicts_with = "index")]
         only: Vec<String>,
 
         /// Number of results to return.
@@ -151,9 +155,19 @@ enum Commands {
 
     /// Show index metadata and statistics.
     Info {
-        /// Index directory (default: .rag).
-        #[arg(short, long)]
+        /// Index directory. When neither --index nor --config is given, uses
+        /// rag.toml/.rag.toml if present, then .rag.
+        #[arg(short, long, conflicts_with = "config")]
         index: Option<PathBuf>,
+
+        /// Show every index declared by this config file. When omitted,
+        /// rag.toml/.rag.toml is discovered automatically.
+        #[arg(short = 'c', long, conflicts_with = "index")]
+        config: Option<PathBuf>,
+
+        /// With an explicit or discovered config, show only these named indexes.
+        #[arg(long, value_delimiter = ',', conflicts_with = "index")]
+        only: Vec<String>,
     },
 
     /// Pre-download the embedding model weights + tokenizer into the cache.
@@ -162,12 +176,21 @@ enum Commands {
     /// fast instead of stalling on a ~90MB network fetch. Safe to re-run —
     /// if every file is already cached it exits immediately.
     Download {
-        /// HuggingFace model ID for embeddings.
-        #[arg(short, long, default_value = DEFAULT_MODEL)]
-        model: String,
+        /// HuggingFace model ID for embeddings. When omitted, uses every model
+        /// in rag.toml/.rag.toml if present, then the built-in default.
+        #[arg(short, long, conflicts_with = "config")]
+        model: Option<String>,
 
-        /// Verify the model loads successfully after downloading (runs a
-        /// tiny inference to catch corrupt downloads).
+        /// Download models used by this config file. When omitted,
+        /// rag.toml/.rag.toml is discovered automatically.
+        #[arg(short = 'c', long, conflicts_with = "model")]
+        config: Option<PathBuf>,
+
+        /// With an explicit or discovered config, include only these indexes.
+        #[arg(long, value_delimiter = ',', conflicts_with = "model")]
+        only: Vec<String>,
+
+        /// Verify each model loads successfully after downloading.
         #[arg(long)]
         verify: bool,
     },
@@ -192,11 +215,6 @@ pub fn run() -> Result<()> {
             include,
         } => match path {
             Some(path) => {
-                // `--only` selects among config entries; it has no meaning for a
-                // single ad-hoc index.
-                if !only.is_empty() {
-                    eprintln!("warning: --only is ignored when a PATH is given");
-                }
                 let discovery = DiscoveryConfig {
                     extra_extensions: ext,
                     exclude,
@@ -208,9 +226,9 @@ pub fn run() -> Result<()> {
                         metadata_root: &path,
                     },
                     output.as_deref(),
-                    &model,
-                    chunk_size,
-                    chunk_overlap,
+                    model.as_deref().unwrap_or(DEFAULT_MODEL),
+                    chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE),
+                    chunk_overlap.unwrap_or(DEFAULT_CHUNK_OVERLAP),
                     &discovery,
                     cache_dir,
                 )
@@ -219,12 +237,16 @@ pub fn run() -> Result<()> {
                 // Config mode: each `[[index]]` entry is self-describing, so the
                 // ad-hoc single-index flags don't apply. Warn rather than
                 // silently ignore them.
-                if output.is_some() || !ext.is_empty() || !exclude.is_empty() || !include.is_empty()
-                {
-                    eprintln!(
-                        "warning: --output/--ext/--exclude/--include are ignored when building \
-                         from a config file; set them per-[[index]] in the config instead"
-                    );
+                if let Some(warning) = ignored_config_options_warning(&[
+                    ("--output", output.is_some()),
+                    ("--model", model.is_some()),
+                    ("--chunk-size", chunk_size.is_some()),
+                    ("--chunk-overlap", chunk_overlap.is_some()),
+                    ("--ext", !ext.is_empty()),
+                    ("--exclude", !exclude.is_empty()),
+                    ("--include", !include.is_empty()),
+                ]) {
+                    eprintln!("{warning}");
                 }
                 cmd_index_from_config(config.as_deref(), &only, cache_dir)
             }
@@ -249,46 +271,134 @@ pub fn run() -> Result<()> {
             json,
             cache_dir,
         }),
-        Commands::Info { index } => cmd_info(index.as_deref()),
-        Commands::Download { model, verify } => cmd_download(&model, verify, cache_dir),
+        Commands::Info {
+            index,
+            config,
+            only,
+        } => cmd_info(index, config.as_deref(), &only),
+        Commands::Download {
+            model,
+            config,
+            only,
+            verify,
+        } => cmd_download(
+            model.as_deref(),
+            config.as_deref(),
+            &only,
+            verify,
+            cache_dir,
+        ),
     }
 }
 
-fn cmd_download(model_id: &str, verify: bool, cache_dir: Option<&std::path::Path>) -> Result<()> {
-    let start = Instant::now();
+fn ignored_config_options_warning(options: &[(&str, bool)]) -> Option<String> {
+    let ignored: Vec<&str> = options
+        .iter()
+        .filter_map(|(name, present)| present.then_some(*name))
+        .collect();
+    (!ignored.is_empty()).then(|| {
+        format!(
+            "warning: {} are ignored when building from a config file; set them per-[[index]] \
+             in the config instead",
+            ignored.join("/")
+        )
+    })
+}
+
+fn resolve_download_models_from_dir(
+    model_override: Option<&str>,
+    config_path: Option<&Path>,
+    only: &[String],
+    cwd: &Path,
+) -> Result<Vec<String>> {
+    if let Some(model) = model_override {
+        if !only.is_empty() {
+            anyhow::bail!("--only requires a config file, but --model was provided");
+        }
+        return Ok(vec![model.to_string()]);
+    }
+
+    let config_path = config_path
+        .map(Path::to_path_buf)
+        .or_else(|| RagConfig::locate(None, cwd));
+    let Some(config_path) = config_path else {
+        if !only.is_empty() {
+            anyhow::bail!(
+                "--only requires --config or a {} file in the current directory",
+                config::DEFAULT_CONFIG_NAMES.join("/")
+            );
+        }
+        return Ok(vec![DEFAULT_MODEL.to_string()]);
+    };
+
+    let config = RagConfig::load(&config_path)?;
+    if let Some(missing) = only
+        .iter()
+        .find(|name| !config.indexes.iter().any(|entry| &entry.name == *name))
+    {
+        anyhow::bail!(
+            "--only names an index not in {}: {:?}",
+            config_path.display(),
+            missing
+        );
+    }
+
+    let mut seen = HashSet::new();
+    let models = config
+        .indexes
+        .iter()
+        .filter(|entry| only.is_empty() || only.iter().any(|name| name == &entry.name))
+        .map(|entry| entry.model_id(&config, DEFAULT_MODEL))
+        .filter(|model| seen.insert(model.clone()))
+        .collect();
+    Ok(models)
+}
+
+fn cmd_download(
+    model_override: Option<&str>,
+    config_path: Option<&Path>,
+    only: &[String],
+    verify: bool,
+    cache_dir: Option<&Path>,
+) -> Result<()> {
+    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+    let models = resolve_download_models_from_dir(model_override, config_path, only, &cwd)?;
     let hub_root = resolve_hf_cache(cache_dir)?;
 
-    eprintln!("Model: {model_id}");
-    eprintln!("Cache: {}", hub_root.display());
+    for (index, model_id) in models.iter().enumerate() {
+        if index > 0 {
+            eprintln!();
+        }
+        let start = Instant::now();
+        eprintln!("Model: {model_id}");
+        eprintln!("Cache: {}", hub_root.display());
 
-    if model_files_present(&hub_root, model_id) {
-        eprintln!(
-            "All {} model file(s) already cached.",
-            model_file_list().len()
-        );
-    } else {
-        let downloaded = download_model(model_id, cache_dir)?;
-        if downloaded {
+        if model_files_present(&hub_root, model_id) {
+            eprintln!(
+                "All {} model file(s) already cached.",
+                model_file_list().len()
+            );
+        } else if download_model(model_id, cache_dir)? {
             eprintln!(
                 "Downloaded {} file(s) in {:.1}s",
                 model_file_list().len(),
                 start.elapsed().as_secs_f64()
             );
         }
-    }
 
-    if verify {
-        eprintln!("Verifying model loads and produces embeddings...");
-        let mut engine = EmbeddingEngine::load(Some(model_id), cache_dir)?;
-        let vec = engine.embed_one("hello world")?;
-        if vec.is_empty() {
-            anyhow::bail!("Model produced an empty embedding — installation may be corrupt");
+        if verify {
+            eprintln!("Verifying model loads and produces embeddings...");
+            let mut engine = EmbeddingEngine::load(Some(model_id), cache_dir)?;
+            let vec = engine.embed_one("hello world")?;
+            if vec.is_empty() {
+                anyhow::bail!("Model produced an empty embedding — installation may be corrupt");
+            }
+            eprintln!(
+                "  Verified (hidden_size={}, elapsed={:.1}s)",
+                vec.len(),
+                start.elapsed().as_secs_f64()
+            );
         }
-        eprintln!(
-            "  Verified (hidden_size={}, elapsed={:.1}s)",
-            vec.len(),
-            start.elapsed().as_secs_f64()
-        );
     }
 
     Ok(())
@@ -464,16 +574,9 @@ fn cmd_index_from_config(
     let total = selected.len();
     for (i, entry) in selected.iter().enumerate() {
         let index_path = base.join(&entry.path);
-        let output = entry
-            .output
-            .clone()
-            .unwrap_or_else(|| base.join(".rag").join(&entry.name));
+        let output = entry.output_path(&base);
 
-        let model = entry
-            .model
-            .clone()
-            .or_else(|| config.model.clone())
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let model = entry.model_id(&config, DEFAULT_MODEL);
         let chunk_size = entry
             .chunk_size
             .or(config.chunk_size)
@@ -874,15 +977,12 @@ struct JsonResult {
 }
 
 fn configured_search_indexes(config_path: &Path, only: &[String]) -> Result<Vec<SearchIndexSpec>> {
-    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
-    let config_path = RagConfig::locate(Some(config_path), &cwd)
-        .context("Search config path could not be resolved")?;
     let base = config_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let config = RagConfig::load(&config_path)?;
+    let config = RagConfig::load(config_path)?;
 
     if let Some(missing) = only
         .iter()
@@ -899,14 +999,9 @@ fn configured_search_indexes(config_path: &Path, only: &[String]) -> Result<Vec<
         .indexes
         .into_iter()
         .filter(|entry| only.is_empty() || only.iter().any(|name| name == &entry.name))
-        .map(|entry| {
-            let output = entry
-                .output
-                .unwrap_or_else(|| PathBuf::from(".rag").join(&entry.name));
-            SearchIndexSpec {
-                path: base.join(output),
-                name: Some(entry.name),
-            }
+        .map(|entry| SearchIndexSpec {
+            path: entry.output_path(&base),
+            name: Some(entry.name),
         })
         .collect())
 }
@@ -916,19 +1011,41 @@ fn resolve_search_indexes(
     config_path: Option<&Path>,
     only: &[String],
 ) -> Result<Vec<SearchIndexSpec>> {
+    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+    resolve_search_indexes_from_dir(index_dirs, config_path, only, &cwd)
+}
+
+fn resolve_search_indexes_from_dir(
+    index_dirs: Vec<PathBuf>,
+    config_path: Option<&Path>,
+    only: &[String],
+    cwd: &Path,
+) -> Result<Vec<SearchIndexSpec>> {
     if let Some(config_path) = config_path {
         return configured_search_indexes(config_path, only);
     }
-    if index_dirs.is_empty() {
-        return Ok(vec![SearchIndexSpec {
-            name: None,
-            path: Index::default_dir(),
-        }]);
+    if !index_dirs.is_empty() {
+        if !only.is_empty() {
+            anyhow::bail!("--only requires a config file, but --index was provided");
+        }
+        return Ok(index_dirs
+            .into_iter()
+            .map(|path| SearchIndexSpec { name: None, path })
+            .collect());
     }
-    Ok(index_dirs
-        .into_iter()
-        .map(|path| SearchIndexSpec { name: None, path })
-        .collect())
+    if let Some(config_path) = RagConfig::locate(None, cwd) {
+        return configured_search_indexes(&config_path, only);
+    }
+    if !only.is_empty() {
+        anyhow::bail!(
+            "--only requires --config or a {} file in the current directory",
+            config::DEFAULT_CONFIG_NAMES.join("/")
+        );
+    }
+    Ok(vec![SearchIndexSpec {
+        name: None,
+        path: Index::default_dir(),
+    }])
 }
 
 fn validate_search_metadata(
@@ -1195,27 +1312,36 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_info(index_dir: Option<&std::path::Path>) -> Result<()> {
-    let index_dir = index_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(Index::default_dir);
+fn cmd_info(index_dir: Option<PathBuf>, config_path: Option<&Path>, only: &[String]) -> Result<()> {
+    let specs = resolve_search_indexes(index_dir.into_iter().collect(), config_path, only)?;
+    for (position, spec) in specs.iter().enumerate() {
+        if position > 0 {
+            println!();
+        }
+        print_index_info(spec)?;
+    }
+    Ok(())
+}
 
-    let index = Index::load(&index_dir).with_context(|| {
+fn print_index_info(spec: &SearchIndexSpec) -> Result<()> {
+    let index = Index::load(&spec.path).with_context(|| {
         format!(
-            "No index found at {}. Run `rag index <path>` first.",
-            index_dir.display()
+            "No index found at {}. Run `rag index` first.",
+            spec.path.display()
         )
     })?;
 
     let m = &index.meta;
     let duplicate_chunks = index.occurrences.len().saturating_sub(index.texts.len());
-
-    let index_path = index_dir.join("index.bin");
+    let index_path = spec.path.join("index.bin");
     let size = std::fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
 
-    println!("RAG Index Info");
+    match &spec.name {
+        Some(name) => println!("RAG Index Info ({name})"),
+        None => println!("RAG Index Info"),
+    }
     println!("─────────────────────────────────────────");
-    println!("  Index path:    {}", index_dir.display());
+    println!("  Index path:    {}", spec.path.display());
     println!("  Root dir:      {}", m.root_dir);
     println!(
         "  Format:        v{} (F16 unique vectors)",
@@ -1273,8 +1399,10 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_records, merge_federated_results, normalized_metadata_path, unique_text_plan,
-        validate_search_metadata, Cli, Commands, FederatedSearchResult, SearchIndexSpec,
+        compact_records, ignored_config_options_warning, merge_federated_results,
+        normalized_metadata_path, resolve_download_models_from_dir,
+        resolve_search_indexes_from_dir, unique_text_plan, validate_search_metadata, Cli, Commands,
+        FederatedSearchResult, SearchIndexSpec, DEFAULT_MODEL,
     };
     use crate::index::{
         ChunkOccurrence, Index, IndexMeta, SourceRecord, TextRecord, INDEX_FORMAT_VERSION,
@@ -1299,6 +1427,17 @@ mod tests {
         }
     }
 
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rag-cli-{prefix}-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temporary directory should be created");
+        dir
+    }
+
     fn result(score: f32, index_order: usize, text_id: usize) -> FederatedSearchResult {
         FederatedSearchResult {
             index_name: None,
@@ -1311,6 +1450,65 @@ mod tests {
             index_order,
             text_id,
         }
+    }
+
+    #[test]
+    fn index_path_conflicts_with_config_options() {
+        for args in [
+            ["rag", "index", "docs", "--config", "rag.toml"].as_slice(),
+            ["rag", "index", "docs", "--only", "one"].as_slice(),
+        ] {
+            let error = Cli::try_parse_from(args)
+                .err()
+                .expect("index path and config-only options should conflict");
+            assert!(error.to_string().contains("cannot be used with"));
+        }
+    }
+
+    #[test]
+    fn config_mode_warning_lists_only_ignored_options() {
+        let warning = ignored_config_options_warning(&[
+            ("--output", false),
+            ("--model", true),
+            ("--chunk-size", true),
+            ("--include", false),
+        ])
+        .expect("present options should produce a warning");
+
+        assert!(warning.contains("--model/--chunk-size are ignored"));
+        assert!(!warning.contains("--output"));
+        assert!(!warning.contains("--include"));
+        assert!(ignored_config_options_warning(&[("--model", false)]).is_none());
+    }
+
+    #[test]
+    fn index_config_mode_retains_explicit_overrides_for_warning() {
+        let cli = Cli::try_parse_from([
+            "rag",
+            "index",
+            "--config",
+            "rag.toml",
+            "--model",
+            "custom/model",
+            "--chunk-size",
+            "256",
+            "--chunk-overlap",
+            "32",
+        ])
+        .expect("config mode overrides should parse for a warning");
+
+        let Commands::Index {
+            model,
+            chunk_size,
+            chunk_overlap,
+            ..
+        } = cli.command
+        else {
+            panic!("expected index command");
+        };
+        assert_eq!(model.as_deref(), Some("custom/model"));
+        assert_eq!(chunk_size, Some(256));
+        assert_eq!(chunk_overlap, Some(32));
     }
 
     #[test]
@@ -1348,6 +1546,169 @@ mod tests {
         assert!(index.is_empty());
         assert_eq!(config, Some(PathBuf::from("rag.toml")));
         assert_eq!(only, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn search_cli_accepts_only_with_auto_discovered_config() {
+        let cli = Cli::try_parse_from(["rag", "search", "query", "--only", "one,two"])
+            .expect("auto-config --only should parse");
+
+        let Commands::Search { config, only, .. } = cli.command else {
+            panic!("expected search command");
+        };
+        assert!(config.is_none());
+        assert_eq!(only, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn search_defaults_to_config_discovered_in_current_directory() {
+        let dir = temp_dir("auto-config");
+        std::fs::write(
+            dir.join("rag.toml"),
+            "[[index]]\nname = \"docs\"\npath = \"docs\"\noutput = \"indexes/docs\"\n",
+        )
+        .expect("test config should be written");
+
+        let specs = resolve_search_indexes_from_dir(vec![], None, &[], &dir)
+            .expect("default search should discover rag.toml");
+        std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name.as_deref(), Some("docs"));
+        assert_eq!(specs[0].path, dir.join("indexes/docs"));
+    }
+
+    #[test]
+    fn download_discovers_and_deduplicates_config_models() {
+        let dir = temp_dir("download-config");
+        std::fs::write(
+            dir.join("rag.toml"),
+            "model = \"global/model\"\n\
+             [[index]]\nname = \"one\"\npath = \"one\"\n\
+             [[index]]\nname = \"two\"\npath = \"two\"\nmodel = \"other/model\"\n\
+             [[index]]\nname = \"three\"\npath = \"three\"\nmodel = \"other/model\"\n",
+        )
+        .expect("test config should be written");
+
+        let models = resolve_download_models_from_dir(None, None, &[], &dir)
+            .expect("download should discover config models");
+        let selected = resolve_download_models_from_dir(None, None, &["two".into()], &dir)
+            .expect("download --only should select one model");
+        std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+
+        assert_eq!(models, vec!["global/model", "other/model"]);
+        assert_eq!(selected, vec!["other/model"]);
+    }
+
+    #[test]
+    fn download_model_resolution_covers_override_fallback_and_invalid_only() {
+        let dir = temp_dir("download-precedence");
+        std::fs::write(
+            dir.join("rag.toml"),
+            "model = \"config/model\"\n[[index]]\nname = \"docs\"\npath = \"docs\"\n",
+        )
+        .expect("test config should be written");
+
+        let explicit = resolve_download_models_from_dir(Some("explicit/model"), None, &[], &dir)
+            .expect("explicit model should win over discovery");
+        let missing = resolve_download_models_from_dir(None, None, &["missing".into()], &dir)
+            .expect_err("unknown --only name should fail");
+
+        std::fs::remove_file(dir.join("rag.toml")).expect("test config should be removed");
+        let fallback = resolve_download_models_from_dir(None, None, &[], &dir)
+            .expect("missing config should use built-in model");
+        std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+
+        assert_eq!(explicit, vec!["explicit/model"]);
+        assert!(missing.to_string().contains("missing"));
+        assert_eq!(fallback, vec![DEFAULT_MODEL]);
+    }
+
+    #[test]
+    fn config_only_selection_cli_contract() {
+        for args in [
+            ["rag", "info", "--only", "docs"].as_slice(),
+            ["rag", "download", "--only", "docs"].as_slice(),
+        ] {
+            Cli::try_parse_from(args).expect("--only should allow auto-discovered config");
+        }
+
+        for args in [
+            ["rag", "search", "q", "--index", "idx", "--only", "docs"].as_slice(),
+            ["rag", "info", "--index", "idx", "--only", "docs"].as_slice(),
+            ["rag", "download", "--model", "m", "--only", "docs"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "--only should conflict with an explicit non-config source"
+            );
+        }
+    }
+
+    #[test]
+    fn search_config_resolution_follows_precedence_matrix() {
+        let dir = temp_dir("search-precedence");
+        std::fs::write(
+            dir.join("rag.toml"),
+            "[[index]]\nname = \"regular\"\npath = \"docs\"\n",
+        )
+        .expect("regular config should be written");
+        std::fs::write(
+            dir.join(".rag.toml"),
+            "[[index]]\nname = \"dotfile\"\npath = \"docs\"\n",
+        )
+        .expect("dotfile config should be written");
+
+        let cases = [
+            (
+                Some(PathBuf::from("explicit-index")),
+                None,
+                "explicit-index",
+            ),
+            (None, Some(dir.join(".rag.toml")), ".rag/dotfile"),
+            (None, None, ".rag/regular"),
+        ];
+        for (index, config, expected_suffix) in cases {
+            let specs = resolve_search_indexes_from_dir(
+                index.into_iter().collect(),
+                config.as_deref(),
+                &[],
+                &dir,
+            )
+            .expect("search source should resolve");
+            assert_eq!(specs.len(), 1);
+            assert!(specs[0].path.ends_with(expected_suffix));
+        }
+
+        std::fs::remove_file(dir.join("rag.toml")).expect("regular config should be removed");
+        let dotfile = resolve_search_indexes_from_dir(vec![], None, &[], &dir)
+            .expect("dotfile config should be discovered");
+        assert_eq!(dotfile[0].name.as_deref(), Some("dotfile"));
+
+        std::fs::remove_file(dir.join(".rag.toml")).expect("dotfile config should be removed");
+        let fallback = resolve_search_indexes_from_dir(vec![], None, &[], &dir)
+            .expect("search should fall back to .rag");
+        std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
+        assert_eq!(fallback[0].path, PathBuf::from(".rag"));
+    }
+
+    #[test]
+    fn explicit_config_resolves_output_from_config_not_current_directory() {
+        let config_dir = temp_dir("explicit-config");
+        let other_cwd = temp_dir("other-cwd");
+        let config_path = config_dir.join("custom.toml");
+        std::fs::write(
+            &config_path,
+            "[[index]]\nname = \"docs\"\npath = \"docs\"\noutput = \"indexes/docs\"\n",
+        )
+        .expect("explicit config should be written");
+
+        let specs = resolve_search_indexes_from_dir(vec![], Some(&config_path), &[], &other_cwd)
+            .expect("explicit config should resolve");
+        std::fs::remove_dir_all(&config_dir).expect("config directory should be removed");
+        std::fs::remove_dir_all(&other_cwd).expect("other cwd should be removed");
+
+        assert_eq!(specs[0].path, config_dir.join("indexes/docs"));
     }
 
     #[test]

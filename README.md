@@ -77,9 +77,9 @@ To build a whole set of indexes with one command — instead of a shell script
 that calls `rag index` once per directory — declare them in a `rag.toml` and run
 `rag index` with no path. Global keys at the top are defaults; each `[[index]]`
 may override them. Paths and output dirs are resolved relative to the config
-file. Relative source paths remain relative in `meta.json` (and therefore in
-JSON search results), so committed indexes do not contain machine-specific
-absolute paths.
+file, including an explicit `output` value. Relative source paths remain
+relative in `meta.json` (and therefore in JSON search results), so committed
+indexes do not contain machine-specific absolute paths.
 
 ```toml
 # Global defaults (all optional)
@@ -118,8 +118,9 @@ output = ".rag/vendor-docs"   # root-repository index
 The same config can be searched as a federation with one query embedding:
 
 ```bash
-rag search "cache behavior" --config rag.toml
-rag search "cache behavior" --config rag.toml --only docs,reference
+rag search "cache behavior"                  # auto-discovers rag.toml
+rag search "cache behavior" --only docs,reference
+rag search "cache behavior" --config path/to/rag.toml
 ```
 
 ### `rag search <query>`
@@ -128,13 +129,17 @@ Embeds your query and returns the most similar chunks by cosine similarity.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i, --index <dir>` | `.rag` | Index directory to search; repeat to federate several indexes |
-| `-c, --config <file>` | — | Search indexes declared by a `rag.toml` instead of `--index` |
-| `--only <list>` | — | With `--config`, search only these named indexes |
+| `-i, --index <dir>` | auto | Index directory to search; repeat to federate several indexes |
+| `-c, --config <file>` | auto | Search indexes declared by a config file |
+| `--only <list>` | — | With an explicit or discovered config, search only these named indexes |
 | `-k, --top-k <n>` | `5` | Number of results across all indexes |
 | `-m, --model <id>` | *(from index)* | Override embedding model; must match the indexes |
 | `--full` | off | Show full chunk text instead of truncated preview |
 | `--json` | off | Output compact JSON (for piping to LLMs or other tools) |
+
+With neither `--index` nor `--config`, search discovers `rag.toml` or
+`.rag.toml` in the current directory and searches its indexes. If neither file
+exists, it falls back to `.rag`. Explicit options always take precedence.
 
 Repeat `--index` to search existing indexes without merging or rebuilding them:
 
@@ -145,8 +150,11 @@ rag search "cache behavior" \
   -i .rag/examples
 ```
 
-Federated indexes must use the same model and embedding dimensions. They are
-loaded and searched sequentially, keeping peak memory near the largest index
+A config may build independent indexes with different models, but searching
+those indexes together is not possible: federated indexes must use the same
+model and embedding dimensions. Use `--only` to select a compatible subset.
+Compatible indexes are loaded and searched sequentially, keeping peak memory
+near the largest index
 rather than the sum of all indexes. Each index contributes its local top-k, then
 rag-cli computes the global top-k. Exact-text deduplication remains per-index;
 identical text stored in different indexes may appear more than once.
@@ -164,7 +172,12 @@ count, source file count, index size, etc.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i, --index <dir>` | `.rag` | Index directory to inspect |
+| `-i, --index <dir>` | auto | One index directory to inspect |
+| `-c, --config <file>` | auto | Show indexes declared by a config file |
+| `--only <list>` | — | With an explicit or discovered config, show only these indexes |
+
+With no options, `info` discovers `rag.toml`/`.rag.toml` and reports every
+configured index, falling back to `.rag` when no config exists.
 
 ## Hardware acceleration
 
@@ -195,6 +208,12 @@ so it works in those environments without extra configuration.
 The native CoreML backend on Apple Silicon currently supports the default MiniLM model only.
 Non-Apple ONNX builds retain model overrides when the requested repository
 publishes the expected architecture-specific ONNX artifact.
+
+Run `rag download` to prefetch models. With no `--model` or `--config`, it
+auto-discovers `rag.toml`/`.rag.toml`, deduplicates the models used by its
+entries, and downloads each one. Use `--only <names>` to prefetch a subset,
+`--config <file>` to select another config, or `--model <id>` for one explicit
+model. If no config exists, the built-in default model is downloaded.
 
 You can control the cache location:
 

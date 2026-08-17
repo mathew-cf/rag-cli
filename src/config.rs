@@ -76,6 +76,25 @@ pub struct IndexEntry {
     pub include: Vec<String>,
 }
 
+impl IndexEntry {
+    /// Resolve this entry's index output relative to the config directory.
+    pub fn output_path(&self, config_dir: &Path) -> PathBuf {
+        self.output
+            .as_ref()
+            .map(|output| config_dir.join(output))
+            .unwrap_or_else(|| config_dir.join(".rag").join(&self.name))
+    }
+
+    /// Resolve this entry's model using the config-level default and then the
+    /// built-in default.
+    pub fn model_id(&self, config: &RagConfig, default_model: &str) -> String {
+        self.model
+            .clone()
+            .or_else(|| config.model.clone())
+            .unwrap_or_else(|| default_model.to_string())
+    }
+}
+
 impl RagConfig {
     /// Parse a config file from disk.
     pub fn load(path: &Path) -> Result<Self> {
@@ -109,5 +128,44 @@ impl RagConfig {
             .iter()
             .map(|name| dir.join(name))
             .find(|p| p.is_file())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(output: Option<&str>) -> IndexEntry {
+        IndexEntry {
+            name: "docs".into(),
+            path: "sources/docs".into(),
+            output: output.map(PathBuf::from),
+            model: None,
+            chunk_size: None,
+            chunk_overlap: None,
+            extensions: vec![],
+            exclude: vec![],
+            include: vec![],
+        }
+    }
+
+    #[test]
+    fn output_paths_resolve_from_config_directory() {
+        let base = Path::new("repo/config");
+        assert_eq!(entry(None).output_path(base), base.join(".rag/docs"));
+        assert_eq!(
+            entry(Some("indexes/docs")).output_path(base),
+            base.join("indexes/docs")
+        );
+
+        let absolute = if cfg!(windows) {
+            PathBuf::from(r"C:\indexes\docs")
+        } else {
+            PathBuf::from("/indexes/docs")
+        };
+        assert_eq!(
+            entry(Some(absolute.to_str().expect("test path should be UTF-8"))).output_path(base),
+            absolute
+        );
     }
 }
