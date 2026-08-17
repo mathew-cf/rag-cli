@@ -518,6 +518,7 @@ fn cmd_index_from_config(
 
 /// Strip redundant `.` components without canonicalizing, so relative paths
 /// stay relative while meaningful `..` components and absolute roots remain.
+/// Windows separators are serialized as `/` for portable metadata.
 fn normalized_metadata_path(path: &Path) -> String {
     let normalized: PathBuf = path
         .components()
@@ -526,7 +527,12 @@ fn normalized_metadata_path(path: &Path) -> String {
     if normalized.as_os_str().is_empty() {
         ".".to_string()
     } else {
-        normalized.to_string_lossy().to_string()
+        let value = normalized.to_string_lossy();
+        if cfg!(windows) {
+            value.replace('\\', "/")
+        } else {
+            value.into_owned()
+        }
     }
 }
 
