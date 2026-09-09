@@ -2119,9 +2119,14 @@ mod tests {
 
     #[test]
     fn grouped_federated_search_deduplicates_canonical_sources_and_refills() {
+        let workspace_root = if cfg!(windows) {
+            "C:/workspace"
+        } else {
+            "/workspace"
+        };
         let make_index = |shared_score: [f32; 2], unique: &str, unique_score: [f32; 2]| {
             let mut metadata = meta("m", 2);
-            metadata.root_dir = "/workspace".into();
+            metadata.root_dir = workspace_root.into();
             Index::new(
                 metadata,
                 vec![
@@ -2272,14 +2277,16 @@ mod tests {
             item.byte_offset = offset;
             item
         };
+        let a_root = if cfg!(windows) { "C:/a" } else { "/a" };
+        let z_root = if cfg!(windows) { "C:/z" } else { "/z" };
         let candidates = vec![
-            tied("/z", "a.md", 1, 0),
-            tied("/a", "c.md", 1, 1),
-            tied("/a", "a.md", 20, 2),
-            tied("/a", "b.md", 50, 3),
-            tied("/a", "a.md", 10, 4),
+            tied(z_root, "a.md", 1, 0),
+            tied(a_root, "c.md", 1, 1),
+            tied(a_root, "a.md", 20, 2),
+            tied(a_root, "b.md", 50, 3),
+            tied(a_root, "a.md", 10, 4),
         ];
-        let expected = vec![("/a", "a.md", 10), ("/a", "b.md", 50)];
+        let expected = vec![(a_root, "a.md", 10), (a_root, "b.md", 50)];
 
         let forward = merge_federated_results(candidates.clone(), 2, true);
         let reverse = merge_federated_results(candidates.into_iter().rev().collect(), 2, true);
