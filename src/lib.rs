@@ -23,6 +23,10 @@ use crate::ingest::{chunk_file, discover_files, hash_files, DiscoveryConfig};
 const DEFAULT_CHUNK_SIZE: usize = 512;
 const DEFAULT_CHUNK_OVERLAP: usize = 64;
 const DEFAULT_TOP_K: usize = 5;
+/// Maximum number of semantic candidates considered per requested result when
+/// grouping by source. This keeps source diversification bounded for large
+/// indexes while allowing lower-ranked files past a run of same-file chunks.
+const SOURCE_DIVERSE_OVERSAMPLE_FACTOR: usize = 10;
 
 struct IndexSource<'a> {
     path: &'a Path,
@@ -43,6 +47,7 @@ struct SearchSettings<'a> {
     only: &'a [String],
     top_k: usize,
     model_override: Option<&'a str>,
+    group_by_source: bool,
     full: bool,
     json: bool,
     cache_dir: Option<&'a Path>,
@@ -143,6 +148,10 @@ enum Commands {
         /// HuggingFace model ID (must match the one used for indexing).
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Return at most one result from each source file.
+        #[arg(long)]
+        group_by_source: bool,
 
         /// Show full chunk text instead of truncated preview.
         #[arg(long)]
@@ -258,6 +267,7 @@ pub fn run() -> Result<()> {
             only,
             top_k,
             model,
+            group_by_source,
             full,
             json,
         } => cmd_search(SearchSettings {
@@ -267,6 +277,7 @@ pub fn run() -> Result<()> {
             only: &only,
             top_k,
             model_override: model.as_deref(),
+            group_by_source,
             full,
             json,
             cache_dir,
@@ -404,6 +415,16 @@ fn cmd_download(
     Ok(())
 }
 
+fn validate_chunk_settings(chunk_size: usize, chunk_overlap: usize) -> Result<()> {
+    if chunk_size == 0 {
+        anyhow::bail!("chunk size must be greater than zero");
+    }
+    if chunk_overlap >= chunk_size {
+        anyhow::bail!("chunk overlap must be smaller than chunk size");
+    }
+    Ok(())
+}
+
 fn cmd_index(
     source: IndexSource<'_>,
     output: Option<&std::path::Path>,
@@ -413,6 +434,7 @@ fn cmd_index(
     discovery: &DiscoveryConfig,
     cache_dir: Option<&std::path::Path>,
 ) -> Result<()> {
+    validate_chunk_settings(chunk_size, chunk_overlap)?;
     let start = Instant::now();
 
     let root = source
@@ -950,7 +972,22 @@ impl SearchIndexSpec {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FederatedSourceIdentity {
+    /// Absolute metadata roots can be compared across independently stored
+    /// indexes. Canonicalization also collapses symlink aliases when possible.
+    Canonical(PathBuf),
+    /// Relative metadata roots do not record what directory they were relative
+    /// to when the index was built. Scope them to the index rather than risk
+    /// merging unrelated files that happen to have the same relative name.
+    IndexScoped {
+        index_path: PathBuf,
+        root_dir: PathBuf,
+        source: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct FederatedSearchResult {
     index_name: Option<String>,
     index_path: PathBuf,
@@ -961,6 +998,35 @@ struct FederatedSearchResult {
     text: String,
     index_order: usize,
     text_id: usize,
+}
+
+impl FederatedSearchResult {
+    fn source_identity(&self) -> FederatedSourceIdentity {
+        let root = Path::new(&self.root_dir);
+        let source = Path::new(&self.source);
+        if root.is_absolute() {
+            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let canonical_source = canonical_root.join(source);
+            FederatedSourceIdentity::Canonical(
+                canonical_source.canonicalize().unwrap_or(canonical_source),
+            )
+        } else {
+            // There is no reliable corpus anchor in old index metadata for a
+            // relative root (notably `.`). Make the index path absolute and
+            // canonical when possible so aliases of the same index still
+            // group, but separate index files remain separate namespaces.
+            let index_path = self.index_path.canonicalize().unwrap_or_else(|_| {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&self.index_path))
+                    .unwrap_or_else(|_| self.index_path.clone())
+            });
+            FederatedSourceIdentity::IndexScoped {
+                index_path,
+                root_dir: root.to_path_buf(),
+                source: source.to_path_buf(),
+            }
+        }
+    }
 }
 
 /// A single search result for JSON output.
@@ -1117,62 +1183,186 @@ fn search_one_index(
     index: &Index,
     query_embedding: &[f32],
     top_k: usize,
+    group_by_source: bool,
 ) -> Result<Vec<FederatedSearchResult>> {
-    let results = search_top_k(query_embedding, &index.texts, top_k);
-    let mut representative = vec![None; index.texts.len()];
-    for occurrence in &index.occurrences {
-        index
-            .sources
-            .get(occurrence.source_id as usize)
-            .context("Index occurrence references an invalid source ID")?;
-        representative
-            .get_mut(occurrence.text_id as usize)
-            .context("Index occurrence references an invalid text ID")?
-            .get_or_insert(occurrence);
-    }
-
-    results
-        .into_iter()
-        .map(|result| {
-            let occurrence = representative
-                .get(result.text_id)
-                .and_then(|occurrence| *occurrence)
-                .context("Active text record has no source occurrence")?;
-            let source = index
+    if !group_by_source {
+        // Keep the original unique-text search and first-occurrence resolution
+        // untouched when source grouping was not requested.
+        let results = search_top_k(query_embedding, &index.texts, top_k);
+        let mut representative = vec![None; index.texts.len()];
+        for occurrence in &index.occurrences {
+            index
                 .sources
                 .get(occurrence.source_id as usize)
                 .context("Index occurrence references an invalid source ID")?;
-            Ok(FederatedSearchResult {
-                index_name: spec.name.clone(),
-                index_path: spec.path.clone(),
-                root_dir: index.meta.root_dir.clone(),
-                source: source.path.clone(),
-                score: result.score,
-                byte_offset: occurrence.byte_offset,
-                text: result.text.text.clone(),
-                index_order,
-                text_id: result.text_id,
+            representative
+                .get_mut(occurrence.text_id as usize)
+                .context("Index occurrence references an invalid text ID")?
+                .get_or_insert(occurrence);
+        }
+
+        return results
+            .into_iter()
+            .map(|result| {
+                let occurrence = representative
+                    .get(result.text_id)
+                    .and_then(|occurrence| *occurrence)
+                    .context("Active text record has no source occurrence")?;
+                federated_result(spec, index_order, index, &result, occurrence)
             })
+            .collect();
+    }
+
+    if top_k == 0 {
+        return Ok(Vec::new());
+    }
+
+    let candidate_limit = top_k.saturating_mul(SOURCE_DIVERSE_OVERSAMPLE_FACTOR);
+    let results = search_top_k(
+        query_embedding,
+        &index.texts,
+        candidate_limit.min(index.texts.len()),
+    );
+
+    // Map only the bounded semantic window, then retain one occurrence per
+    // source. In particular, do not build a list containing every duplicate
+    // occurrence of a candidate text: that can be much larger than the index's
+    // source set and candidate window.
+    let candidate_rank: HashMap<usize, usize> = results
+        .iter()
+        .enumerate()
+        .map(|(rank, result)| (result.text_id, rank))
+        .collect();
+    let mut best_by_source: HashMap<&str, (usize, &ChunkOccurrence)> = HashMap::new();
+    let compare_candidate =
+        |a_source: &str,
+         &(a_rank, a_occurrence): &(usize, &ChunkOccurrence),
+         b_source: &str,
+         &(b_rank, b_occurrence): &(usize, &ChunkOccurrence)| {
+            results[b_rank]
+                .score
+                .total_cmp(&results[a_rank].score)
+                .then_with(|| a_source.cmp(b_source))
+                .then_with(|| a_occurrence.byte_offset.cmp(&b_occurrence.byte_offset))
+                .then_with(|| results[a_rank].text.text.cmp(&results[b_rank].text.text))
+                .then_with(|| results[a_rank].text_id.cmp(&results[b_rank].text_id))
+        };
+    for occurrence in &index.occurrences {
+        let source = index
+            .sources
+            .get(occurrence.source_id as usize)
+            .context("Index occurrence references an invalid source ID")?;
+        index
+            .texts
+            .get(occurrence.text_id as usize)
+            .context("Index occurrence references an invalid text ID")?;
+
+        let Some(&rank) = candidate_rank.get(&(occurrence.text_id as usize)) else {
+            continue;
+        };
+        let source_path = source.path.as_str();
+        let candidate = (rank, occurrence);
+        if let Some(best) = best_by_source.get(source_path) {
+            if compare_candidate(source_path, &candidate, source_path, best).is_lt() {
+                best_by_source.insert(source_path, candidate);
+            }
+            continue;
+        }
+        if best_by_source.len() < candidate_limit {
+            best_by_source.insert(source_path, candidate);
+            continue;
+        }
+        let worst_source = best_by_source
+            .iter()
+            .max_by(|(a_source, a), (b_source, b)| compare_candidate(a_source, a, b_source, b))
+            .map(|(path, _)| (*path).to_string());
+        if let Some(worst_source) = worst_source {
+            let worst = best_by_source
+                .get(worst_source.as_str())
+                .expect("selected source must remain present");
+            if compare_candidate(source_path, &candidate, worst_source.as_str(), worst).is_lt() {
+                best_by_source.remove(worst_source.as_str());
+                best_by_source.insert(source_path, candidate);
+            }
+        }
+    }
+
+    // Return an oversampled source window, rather than only k local sources,
+    // so the global merge can refill slots removed by cross-index overlap.
+    let grouped = best_by_source
+        .into_values()
+        .map(|(rank, occurrence)| {
+            federated_result(spec, index_order, index, &results[rank], occurrence)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(limit_federated_results(grouped, candidate_limit))
+}
+
+fn federated_result(
+    spec: &SearchIndexSpec,
+    index_order: usize,
+    index: &Index,
+    result: &crate::index::SearchResult<'_>,
+    occurrence: &ChunkOccurrence,
+) -> Result<FederatedSearchResult> {
+    let source = index
+        .sources
+        .get(occurrence.source_id as usize)
+        .context("Index occurrence references an invalid source ID")?;
+    Ok(FederatedSearchResult {
+        index_name: spec.name.clone(),
+        index_path: spec.path.clone(),
+        root_dir: index.meta.root_dir.clone(),
+        source: source.path.clone(),
+        score: result.score,
+        byte_offset: occurrence.byte_offset,
+        text: result.text.text.clone(),
+        index_order,
+        text_id: result.text_id,
+    })
+}
+
+fn compare_federated_results(
+    a: &FederatedSearchResult,
+    b: &FederatedSearchResult,
+) -> std::cmp::Ordering {
+    b.score
+        .total_cmp(&a.score)
+        // Score ties must not depend on hash iteration, occurrence order, or
+        // select_nth_unstable's partitioning at the cutoff.
+        .then_with(|| a.root_dir.cmp(&b.root_dir))
+        .then_with(|| a.source.cmp(&b.source))
+        .then_with(|| a.byte_offset.cmp(&b.byte_offset))
+        .then_with(|| a.text.cmp(&b.text))
+        .then_with(|| a.index_path.cmp(&b.index_path))
+        .then_with(|| a.index_name.cmp(&b.index_name))
+        .then_with(|| a.index_order.cmp(&b.index_order))
+        .then_with(|| a.text_id.cmp(&b.text_id))
+}
+
+fn limit_federated_results(
+    mut results: Vec<FederatedSearchResult>,
+    limit: usize,
+) -> Vec<FederatedSearchResult> {
+    if results.len() > limit {
+        results.select_nth_unstable_by(limit, compare_federated_results);
+        results.truncate(limit);
+    }
+    results.sort_by(compare_federated_results);
+    results
 }
 
 fn merge_federated_results(
     mut results: Vec<FederatedSearchResult>,
     top_k: usize,
+    group_by_source: bool,
 ) -> Vec<FederatedSearchResult> {
-    let by_score = |a: &FederatedSearchResult, b: &FederatedSearchResult| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.index_order.cmp(&b.index_order))
-            .then_with(|| a.text_id.cmp(&b.text_id))
-    };
-    if results.len() > top_k {
-        results.select_nth_unstable_by(top_k, by_score);
-        results.truncate(top_k);
+    if group_by_source {
+        results.sort_by(compare_federated_results);
+        let mut seen_sources = HashSet::new();
+        results.retain(|result| seen_sources.insert(result.source_identity()));
     }
-    results.sort_by(by_score);
-    results
+    limit_federated_results(results, top_k)
 }
 
 fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
@@ -1183,6 +1373,7 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
         only,
         top_k,
         model_override,
+        group_by_source,
         full,
         json,
         cache_dir,
@@ -1241,9 +1432,10 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
             &index,
             &query_embedding,
             top_k,
+            group_by_source,
         )?);
     }
-    let results = merge_federated_results(candidates, top_k);
+    let results = merge_federated_results(candidates, top_k, group_by_source);
     let search_time = start.elapsed();
 
     if json {
@@ -1401,8 +1593,9 @@ mod tests {
     use super::{
         compact_records, ignored_config_options_warning, merge_federated_results,
         normalized_metadata_path, resolve_download_models_from_dir,
-        resolve_search_indexes_from_dir, unique_text_plan, validate_search_metadata, Cli, Commands,
-        FederatedSearchResult, SearchIndexSpec, DEFAULT_MODEL,
+        resolve_search_indexes_from_dir, search_one_index, unique_text_plan,
+        validate_chunk_settings, validate_search_metadata, Cli, Commands, FederatedSearchResult,
+        SearchIndexSpec, DEFAULT_MODEL,
     };
     use crate::index::{
         ChunkOccurrence, Index, IndexMeta, SourceRecord, TextRecord, INDEX_FORMAT_VERSION,
@@ -1410,6 +1603,14 @@ mod tests {
     use clap::Parser;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn chunk_settings_require_progress_and_smaller_overlap() {
+        assert!(validate_chunk_settings(512, 64).is_ok());
+        assert!(validate_chunk_settings(0, 0).is_err());
+        assert!(validate_chunk_settings(64, 64).is_err());
+        assert!(validate_chunk_settings(64, 65).is_err());
+    }
 
     fn meta(model: &str, hidden_size: usize) -> IndexMeta {
         IndexMeta {
@@ -1517,7 +1718,13 @@ mod tests {
             Cli::try_parse_from(["rag", "search", "query", "-i", ".rag/one", "-i", ".rag/two"])
                 .expect("repeated indexes should parse");
 
-        let Commands::Search { index, config, .. } = cli.command else {
+        let Commands::Search {
+            index,
+            config,
+            group_by_source,
+            ..
+        } = cli.command
+        else {
             panic!("expected search command");
         };
         assert_eq!(
@@ -1525,6 +1732,21 @@ mod tests {
             vec![PathBuf::from(".rag/one"), PathBuf::from(".rag/two")]
         );
         assert!(config.is_none());
+        assert!(!group_by_source, "source grouping must remain opt-in");
+    }
+
+    #[test]
+    fn search_cli_accepts_group_by_source() {
+        let cli = Cli::try_parse_from(["rag", "search", "query", "--group-by-source"])
+            .expect("source grouping should parse");
+
+        let Commands::Search {
+            group_by_source, ..
+        } = cli.command
+        else {
+            panic!("expected search command");
+        };
+        assert!(group_by_source);
     }
 
     #[test]
@@ -1744,6 +1966,341 @@ mod tests {
     }
 
     #[test]
+    fn grouped_search_continues_past_same_source_chunks() {
+        let index = Index::new(
+            meta("m", 2),
+            vec![
+                SourceRecord {
+                    path: "a.md".into(),
+                },
+                SourceRecord {
+                    path: "b.md".into(),
+                },
+                SourceRecord {
+                    path: "c.md".into(),
+                },
+            ],
+            vec![
+                TextRecord::new("a best".into(), vec![1.0, 0.0]),
+                TextRecord::new("a second".into(), vec![0.99, 0.1]),
+                TextRecord::new("a third".into(), vec![0.98, 0.2]),
+                TextRecord::new("b best".into(), vec![0.8, 0.6]),
+                TextRecord::new("c best".into(), vec![0.7, 0.714]),
+            ],
+            vec![
+                ChunkOccurrence {
+                    source_id: 0,
+                    text_id: 0,
+                    byte_offset: 0,
+                },
+                ChunkOccurrence {
+                    source_id: 0,
+                    text_id: 1,
+                    byte_offset: 10,
+                },
+                ChunkOccurrence {
+                    source_id: 0,
+                    text_id: 2,
+                    byte_offset: 20,
+                },
+                ChunkOccurrence {
+                    source_id: 1,
+                    text_id: 3,
+                    byte_offset: 30,
+                },
+                ChunkOccurrence {
+                    source_id: 2,
+                    text_id: 4,
+                    byte_offset: 40,
+                },
+            ],
+        );
+        let spec = SearchIndexSpec {
+            name: None,
+            path: ".rag".into(),
+        };
+
+        let grouped = search_one_index(&spec, 0, &index, &[1.0, 0.0], 3, true)
+            .expect("grouped search should succeed");
+
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|item| item.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.md", "b.md", "c.md"]
+        );
+        assert_eq!(grouped[0].text, "a best");
+    }
+
+    #[test]
+    fn grouped_search_expands_identical_text_to_each_source() {
+        let index = Index::new(
+            meta("m", 2),
+            vec![
+                SourceRecord {
+                    path: "first.md".into(),
+                },
+                SourceRecord {
+                    path: "second.md".into(),
+                },
+            ],
+            vec![TextRecord::new("shared text".into(), vec![1.0, 0.0])],
+            vec![
+                ChunkOccurrence {
+                    source_id: 0,
+                    text_id: 0,
+                    byte_offset: 11,
+                },
+                ChunkOccurrence {
+                    source_id: 1,
+                    text_id: 0,
+                    byte_offset: 22,
+                },
+            ],
+        );
+        let spec = SearchIndexSpec {
+            name: None,
+            path: ".rag".into(),
+        };
+
+        let default = search_one_index(&spec, 0, &index, &[1.0, 0.0], 2, false)
+            .expect("default search should succeed");
+        let grouped = search_one_index(&spec, 0, &index, &[1.0, 0.0], 2, true)
+            .expect("grouped search should succeed");
+
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].source, "first.md");
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|item| (item.source.as_str(), item.byte_offset))
+                .collect::<Vec<_>>(),
+            vec![("first.md", 11), ("second.md", 22)]
+        );
+    }
+
+    #[test]
+    fn grouped_search_keeps_each_sources_highest_scoring_occurrence() {
+        let index = Index::new(
+            meta("m", 2),
+            vec![SourceRecord {
+                path: "only.md".into(),
+            }],
+            vec![
+                TextRecord::new("lower".into(), vec![0.6, 0.8]),
+                TextRecord::new("higher".into(), vec![1.0, 0.0]),
+            ],
+            vec![
+                ChunkOccurrence {
+                    source_id: 0,
+                    text_id: 0,
+                    byte_offset: 5,
+                },
+                ChunkOccurrence {
+                    source_id: 0,
+                    text_id: 1,
+                    byte_offset: 50,
+                },
+            ],
+        );
+        let spec = SearchIndexSpec {
+            name: None,
+            path: ".rag".into(),
+        };
+
+        let grouped = search_one_index(&spec, 0, &index, &[1.0, 0.0], 2, true)
+            .expect("grouped search should succeed");
+
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].text, "higher");
+        assert_eq!(grouped[0].byte_offset, 50);
+    }
+
+    #[test]
+    fn grouped_federated_search_deduplicates_canonical_sources_and_refills() {
+        let make_index = |shared_score: [f32; 2], unique: &str, unique_score: [f32; 2]| {
+            let mut metadata = meta("m", 2);
+            metadata.root_dir = "/workspace".into();
+            Index::new(
+                metadata,
+                vec![
+                    SourceRecord {
+                        path: "shared.md".into(),
+                    },
+                    SourceRecord {
+                        path: unique.into(),
+                    },
+                    SourceRecord {
+                        path: format!("extra-{unique}"),
+                    },
+                ],
+                vec![
+                    TextRecord::new(format!("shared from {unique}"), shared_score.to_vec()),
+                    TextRecord::new(format!("unique {unique}"), unique_score.to_vec()),
+                    TextRecord::new(format!("extra {unique}"), vec![0.6, 0.8]),
+                ],
+                vec![
+                    ChunkOccurrence {
+                        source_id: 0,
+                        text_id: 0,
+                        byte_offset: 20,
+                    },
+                    ChunkOccurrence {
+                        source_id: 1,
+                        text_id: 1,
+                        byte_offset: 10,
+                    },
+                    ChunkOccurrence {
+                        source_id: 2,
+                        text_id: 2,
+                        byte_offset: 30,
+                    },
+                ],
+            )
+        };
+        let specs = [
+            SearchIndexSpec {
+                name: Some("one".into()),
+                path: ".rag/one".into(),
+            },
+            SearchIndexSpec {
+                name: Some("two".into()),
+                path: ".rag/two".into(),
+            },
+        ];
+        let indexes = [
+            make_index([0.99, 0.141], "alpha.md", [0.8, 0.6]),
+            make_index([1.0, 0.0], "beta.md", [0.9, 0.436]),
+        ];
+        let mut candidates = Vec::new();
+        for (order, (spec, index)) in specs.iter().zip(&indexes).enumerate() {
+            let local = search_one_index(spec, order, index, &[1.0, 0.0], 2, true)
+                .expect("grouped index search should succeed");
+            assert_eq!(
+                local.len(),
+                3,
+                "each index should overfetch source candidates"
+            );
+            candidates.extend(local);
+        }
+
+        let default = merge_federated_results(candidates.clone(), 2, false);
+        assert_eq!(
+            default
+                .iter()
+                .filter(|result| result.source == "shared.md")
+                .count(),
+            2,
+            "the default merge must preserve overlapping index results"
+        );
+
+        let grouped = merge_federated_results(candidates, 2, true);
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|result| (result.source.as_str(), result.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("shared.md", "shared from beta.md"),
+                ("beta.md", "unique beta.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_federated_search_scopes_relative_roots_to_each_index() {
+        let relative = |index_path: &str, score: f32, index_order: usize| {
+            let mut item = result(score, index_order, 0);
+            item.index_path = index_path.into();
+            item.root_dir = ".".into();
+            item.source = "same-name.md".into();
+            item
+        };
+
+        let grouped = merge_federated_results(
+            vec![
+                relative("/corpus-one/.rag", 1.0, 0),
+                relative("/corpus-two/.rag", 0.9, 1),
+            ],
+            2,
+            true,
+        );
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].index_path, PathBuf::from("/corpus-one/.rag"));
+        assert_eq!(grouped[1].index_path, PathBuf::from("/corpus-two/.rag"));
+    }
+
+    #[test]
+    fn grouped_search_does_not_materialize_duplicate_occurrences() {
+        const DUPLICATES: usize = 100_000;
+        let occurrences = (0..DUPLICATES)
+            .rev()
+            .map(|byte_offset| ChunkOccurrence {
+                source_id: 0,
+                text_id: 0,
+                byte_offset,
+            })
+            .collect();
+        let index = Index::new(
+            meta("m", 1),
+            vec![SourceRecord {
+                path: "duplicate-heavy.md".into(),
+            }],
+            vec![TextRecord::new("repeated".into(), vec![1.0])],
+            occurrences,
+        );
+        let spec = SearchIndexSpec {
+            name: None,
+            path: ".rag".into(),
+        };
+
+        let grouped = search_one_index(&spec, 0, &index, &[1.0], 5, true)
+            .expect("duplicate-heavy grouped search should succeed");
+
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].byte_offset, 0);
+    }
+
+    #[test]
+    fn grouped_cutoff_ties_are_deterministic_by_source_and_offset() {
+        let tied = |root: &str, source: &str, offset: usize, index_order: usize| {
+            let mut item = result(1.0, index_order, index_order);
+            item.root_dir = root.into();
+            item.source = source.into();
+            item.byte_offset = offset;
+            item
+        };
+        let candidates = vec![
+            tied("/z", "a.md", 1, 0),
+            tied("/a", "c.md", 1, 1),
+            tied("/a", "a.md", 20, 2),
+            tied("/a", "b.md", 50, 3),
+            tied("/a", "a.md", 10, 4),
+        ];
+        let expected = vec![("/a", "a.md", 10), ("/a", "b.md", 50)];
+
+        let forward = merge_federated_results(candidates.clone(), 2, true);
+        let reverse = merge_federated_results(candidates.into_iter().rev().collect(), 2, true);
+        for merged in [forward, reverse] {
+            assert_eq!(
+                merged
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.root_dir.as_str(),
+                            item.source.as_str(),
+                            item.byte_offset,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn federated_merge_returns_global_top_k_with_stable_ties() {
         let merged = merge_federated_results(
             vec![
@@ -1753,6 +2310,7 @@ mod tests {
                 result(0.7, 0, 3),
             ],
             3,
+            false,
         );
 
         assert_eq!(

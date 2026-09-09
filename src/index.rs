@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 pub const INDEX_FORMAT_VERSION: u32 = 2;
 
@@ -67,7 +70,7 @@ pub struct ChunkOccurrence {
 }
 
 /// Metadata stored alongside the index.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct IndexMeta {
     /// On-disk schema version. A mismatch forces a full rebuild.
     #[serde(default)]
@@ -124,6 +127,50 @@ pub struct Index {
     pub occurrences: Vec<ChunkOccurrence>,
 }
 
+static SAVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+struct PublicationLock {
+    path: PathBuf,
+}
+
+impl PublicationLock {
+    fn acquire(dir: &Path) -> Result<Self> {
+        let path = dir.join(".index-publish.lock");
+        for _ in 0..100 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    file.sync_all()?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Never reclaim by age: deleting a path that another writer
+                    // just recreated can admit two publishers. A lock left by a
+                    // crashed process is rare and must be removed explicitly.
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    return Err(error).context("Failed to acquire index publication lock")
+                }
+            }
+        }
+        anyhow::bail!(
+            "Another process is publishing this index; retry shortly. If its process crashed, remove {}",
+            path.display()
+        )
+    }
+}
+
+impl Drop for PublicationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 impl Index {
     pub fn new(
         meta: IndexMeta,
@@ -144,31 +191,75 @@ impl Index {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create index directory: {}", dir.display()))?;
 
+        let generation = SAVE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let suffix = format!("tmp-{}-{generation}", std::process::id());
         let meta_path = dir.join("meta.json");
-        let meta_json = serde_json::to_string_pretty(&self.meta)?;
-        std::fs::write(&meta_path, meta_json)
-            .with_context(|| format!("Failed to write {}", meta_path.display()))?;
-
         let index_path = dir.join("index.bin");
-        let file = std::fs::File::create(&index_path)
-            .with_context(|| format!("Failed to create {}", index_path.display()))?;
-        let mut writer = BufWriter::new(file);
-        bincode::serialize_into(&mut writer, self)
-            .with_context(|| format!("Failed to write {}", index_path.display()))?;
-        writer
-            .flush()
-            .with_context(|| format!("Failed to flush {}", index_path.display()))?;
+        let meta_temp = dir.join(format!("meta.json.{suffix}"));
+        let index_temp = dir.join(format!("index.bin.{suffix}"));
 
-        Ok(())
+        let result = (|| -> Result<()> {
+            let meta_json = serde_json::to_string_pretty(&self.meta)?;
+            let mut meta_file = std::fs::File::create(&meta_temp)
+                .with_context(|| format!("Failed to create {}", meta_temp.display()))?;
+            meta_file
+                .write_all(meta_json.as_bytes())
+                .with_context(|| format!("Failed to write {}", meta_temp.display()))?;
+            meta_file
+                .sync_all()
+                .with_context(|| format!("Failed to sync {}", meta_temp.display()))?;
+
+            let file = std::fs::File::create(&index_temp)
+                .with_context(|| format!("Failed to create {}", index_temp.display()))?;
+            let mut writer = BufWriter::new(file);
+            bincode::serialize_into(&mut writer, self)
+                .with_context(|| format!("Failed to write {}", index_temp.display()))?;
+            writer
+                .flush()
+                .with_context(|| format!("Failed to flush {}", index_temp.display()))?;
+            writer
+                .get_ref()
+                .sync_all()
+                .with_context(|| format!("Failed to sync {}", index_temp.display()))?;
+
+            let _publication_lock = PublicationLock::acquire(dir)?;
+            // Each file replacement is atomic. Metadata is the commit marker;
+            // readers also compare it with the metadata embedded in index.bin,
+            // so the brief two-rename window fails closed instead of mixing generations.
+            std::fs::rename(&index_temp, &index_path)
+                .with_context(|| format!("Failed to replace {}", index_path.display()))?;
+            std::fs::rename(&meta_temp, &meta_path)
+                .with_context(|| format!("Failed to replace {}", meta_path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&meta_temp);
+            let _ = std::fs::remove_file(&index_temp);
+        }
+        result
     }
 
     /// Load only index metadata, without materializing the vector index.
+    /// The same metadata is the first bincode field, so this also cheaply
+    /// validates that the two published files belong to one generation.
     pub fn load_meta(dir: &Path) -> Result<IndexMeta> {
         let meta_path = dir.join("meta.json");
         let file = std::fs::File::open(&meta_path)
             .with_context(|| format!("Failed to open {}", meta_path.display()))?;
-        serde_json::from_reader(BufReader::new(file))
-            .with_context(|| format!("Failed to deserialize {}", meta_path.display()))
+        let metadata: IndexMeta = serde_json::from_reader(BufReader::new(file))
+            .with_context(|| format!("Failed to deserialize {}", meta_path.display()))?;
+
+        let index_path = dir.join("index.bin");
+        let index_file = std::fs::File::open(&index_path)
+            .with_context(|| format!("Failed to open {}", index_path.display()))?;
+        let embedded: IndexMeta = bincode::deserialize_from(BufReader::new(index_file))
+            .context("Failed to read embedded index metadata (corrupted or version mismatch?)")?;
+        if metadata != embedded {
+            anyhow::bail!(
+                "Index generation mismatch between meta.json and index.bin; rebuild the index"
+            );
+        }
+        Ok(metadata)
     }
 
     /// Load index from a directory.
@@ -178,6 +269,12 @@ impl Index {
             .with_context(|| format!("Failed to open {}", index_path.display()))?;
         let index: Self = bincode::deserialize_from(BufReader::new(file))
             .context("Failed to deserialize index (corrupted or version mismatch?)")?;
+        let metadata = Self::load_meta(dir)?;
+        if metadata != index.meta {
+            anyhow::bail!(
+                "Index generation mismatch between meta.json and index.bin; rebuild the index"
+            );
+        }
         Ok(index)
     }
 
@@ -275,6 +372,37 @@ mod tests {
             chunk_overlap: 64,
             file_hashes: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn save_replaces_complete_files_and_load_rejects_mixed_generations() {
+        let dir = std::env::temp_dir().join(format!(
+            "rag-index-save-{}-{}",
+            std::process::id(),
+            SAVE_GENERATION.fetch_add(1, Ordering::Relaxed),
+        ));
+        let index = Index::new(meta(), Vec::new(), Vec::new(), Vec::new());
+        index.save(&dir).unwrap();
+        assert_eq!(Index::load(&dir).unwrap().meta, index.meta);
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp-")));
+
+        let mut mismatched = index.meta.clone();
+        mismatched.created_at = "different generation".to_string();
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_string_pretty(&mismatched).unwrap(),
+        )
+        .unwrap();
+        assert!(Index::load(&dir)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("generation mismatch"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -134,12 +134,35 @@ Embeds your query and returns the most similar chunks by cosine similarity.
 | `--only <list>` | — | With an explicit or discovered config, search only these named indexes |
 | `-k, --top-k <n>` | `5` | Number of results across all indexes |
 | `-m, --model <id>` | *(from index)* | Override embedding model; must match the indexes |
+| `--group-by-source` | off | Return at most one result from each source file |
 | `--full` | off | Show full chunk text instead of truncated preview |
 | `--json` | off | Output compact JSON (for piping to LLMs or other tools) |
 
 With neither `--index` nor `--config`, search discovers `rag.toml` or
 `.rag.toml` in the current directory and searches its indexes. If neither file
 exists, it falls back to `.rag`. Explicit options always take precedence.
+
+Use `--group-by-source` when broad source coverage is more useful than several
+high-scoring chunks from one file:
+
+```bash
+rag search "cache behavior" --top-k 5 --group-by-source
+```
+
+In this mode, rag-cli considers a bounded window of up to 10 times `--top-k`
+semantic candidates in each index and keeps each source's best occurrence from
+that window. Federated results are then grouped globally. Sources under absolute
+`root_dir` values overlap by canonical root and source path, so only the best
+result is retained. A relative `root_dir` (such as `.`) cannot be resolved
+reliably from portable index metadata, so its identity is scoped to that index;
+this avoids merging unrelated same-named files from indexes built in different
+directories. Per-index source candidates are also overfetched
+(up to the same bound) so the global merge can refill slots removed by overlap.
+If the bounded windows contain fewer than `k` distinct canonical sources, fewer
+than `k` results are returned. Identical chunk text occurring in several files
+can represent each file. Without this flag, search behavior is unchanged: it
+ranks unique chunk bodies per index and resolves each result to its first
+occurrence, without cross-index source grouping.
 
 Repeat `--index` to search existing indexes without merging or rebuilding them:
 
