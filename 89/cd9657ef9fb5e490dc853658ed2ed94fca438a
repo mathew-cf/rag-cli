@@ -1,0 +1,19 @@
+src/index.rs
+  s_d009c108f035ba::t_de7255233bfb55 7-9,73,130-173,194-195,198-239,243-244,249-262,272-277,377-407
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "89cd9657ef9fb5e490dc853658ed2ed94fca438a",
+  "prompts": {},
+  "sessions": {
+    "s_d009c108f035ba": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f78a481f2ffe6lWCxp4EUFiGWj",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Mathew Jacob <mathew@cloudflare.com>"
+    }
+  }
+}
