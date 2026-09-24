@@ -2,10 +2,12 @@ mod config;
 mod embed;
 mod index;
 mod ingest;
+mod keyword;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Instant;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -48,6 +50,7 @@ struct SearchSettings<'a> {
     top_k: usize,
     model_override: Option<&'a str>,
     group_by_source: bool,
+    hybrid: bool,
     full: bool,
     json: bool,
     cache_dir: Option<&'a Path>,
@@ -153,6 +156,10 @@ enum Commands {
         #[arg(long)]
         group_by_source: bool,
 
+        /// Combine semantic ranking with live keyword matches.
+        #[arg(long)]
+        hybrid: bool,
+
         /// Show full chunk text instead of truncated preview.
         #[arg(long)]
         full: bool,
@@ -160,6 +167,32 @@ enum Commands {
         /// Output results as compact JSON (for piping to LLMs or other tools).
         #[arg(long)]
         json: bool,
+    },
+
+    /// Search live files for keywords without loading an embedding model.
+    Keyword {
+        /// File or directory to search recursively.
+        path: PathBuf,
+
+        /// Patterns to match (OR; repeat -e for several patterns).
+        #[arg(short = 'e', long = "regexp", required = true)]
+        patterns: Vec<String>,
+
+        /// Treat patterns as literal strings instead of regexes.
+        #[arg(short = 'F', long = "fixed-strings")]
+        fixed_strings: bool,
+
+        /// Match without regard to case.
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
+
+        /// Include or exclude paths using ripgrep-style globs (repeatable).
+        #[arg(long = "glob")]
+        globs: Vec<String>,
+
+        /// Print only matching file paths.
+        #[arg(short = 'l', long = "files-with-matches")]
+        files_with_matches: bool,
     },
 
     /// Show index metadata and statistics.
@@ -206,11 +239,11 @@ enum Commands {
 }
 
 /// Entry point for the CLI. Call this from `main()`.
-pub fn run() -> Result<()> {
+pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     let cache_dir = cli.cache_dir.as_deref();
 
-    match cli.command {
+    let matched = match cli.command {
         Commands::Index {
             path,
             config,
@@ -259,7 +292,8 @@ pub fn run() -> Result<()> {
                 }
                 cmd_index_from_config(config.as_deref(), &only, cache_dir)
             }
-        },
+        }
+        .map(|_| true),
         Commands::Search {
             query,
             index,
@@ -268,6 +302,7 @@ pub fn run() -> Result<()> {
             top_k,
             model,
             group_by_source,
+            hybrid,
             full,
             json,
         } => cmd_search(SearchSettings {
@@ -278,15 +313,32 @@ pub fn run() -> Result<()> {
             top_k,
             model_override: model.as_deref(),
             group_by_source,
+            hybrid,
             full,
             json,
             cache_dir,
-        }),
+        })
+        .map(|_| true),
+        Commands::Keyword {
+            path,
+            patterns,
+            fixed_strings,
+            ignore_case,
+            globs,
+            files_with_matches,
+        } => cmd_keyword(
+            &path,
+            &patterns,
+            fixed_strings,
+            ignore_case,
+            &globs,
+            files_with_matches,
+        ),
         Commands::Info {
             index,
             config,
             only,
-        } => cmd_info(index, config.as_deref(), &only),
+        } => cmd_info(index, config.as_deref(), &only).map(|_| true),
         Commands::Download {
             model,
             config,
@@ -298,8 +350,46 @@ pub fn run() -> Result<()> {
             &only,
             verify,
             cache_dir,
-        ),
+        )
+        .map(|_| true),
+    }?;
+    Ok(if matched {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+fn cmd_keyword(
+    path: &Path,
+    patterns: &[String],
+    fixed_strings: bool,
+    ignore_case: bool,
+    globs: &[String],
+    files_with_matches: bool,
+) -> Result<bool> {
+    let matcher = keyword::matcher(patterns, fixed_strings, ignore_case)?;
+    let mut found = false;
+    for file in keyword::walk_files(path, globs)? {
+        let hits = keyword::scan_file(&matcher, &file, files_with_matches)?;
+        if hits.is_empty() {
+            continue;
+        }
+        found = true;
+        if files_with_matches {
+            println!("{}", file.display());
+        } else {
+            for hit in hits {
+                println!(
+                    "{}:{}:{}",
+                    file.display(),
+                    hit.line_number.unwrap_or(0),
+                    hit.line
+                );
+            }
+        }
     }
+    Ok(found)
 }
 
 fn ignored_config_options_warning(options: &[(&str, bool)]) -> Option<String> {
@@ -465,6 +555,11 @@ fn cmd_index(
     // index (hundreds of MiB for a large corpus).
     let had_previous = index_dir.join("index.bin").is_file();
     let prev_meta = Index::load_meta(&index_dir).ok();
+    let current_source_root_from_index = if had_previous {
+        Some(relative_source_root(&index_dir, &root)?)
+    } else {
+        None
+    };
     let can_reuse = had_previous
         && prev_meta.as_ref().is_some_and(|meta| {
             meta.root_dir == metadata_root
@@ -472,9 +567,15 @@ fn cmd_index(
         });
 
     if can_reuse
-        && prev_meta
-            .as_ref()
-            .is_some_and(|m| m.file_hashes == current_hashes)
+        && prev_meta.as_ref().is_some_and(|m| {
+            index_files_and_source_unchanged(
+                m,
+                &current_hashes,
+                current_source_root_from_index
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+        })
     {
         let meta = prev_meta
             .as_ref()
@@ -514,6 +615,9 @@ fn cmd_index(
     }
 
     // 3. Save index
+    std::fs::create_dir_all(&index_dir)
+        .with_context(|| format!("Failed to create {}", index_dir.display()))?;
+    let source_root_from_index = relative_source_root(&index_dir, &root)?;
     let meta = IndexMeta {
         format_version: INDEX_FORMAT_VERSION,
         model_id: model_id.to_string(),
@@ -522,6 +626,7 @@ fn cmd_index(
         num_chunks: occurrences.len(),
         num_unique_texts: texts.len(),
         root_dir: metadata_root,
+        source_root_from_index,
         created_at: chrono_now(),
         chunk_size,
         chunk_overlap,
@@ -540,6 +645,35 @@ fn cmd_index(
     );
 
     Ok(())
+}
+
+fn index_files_and_source_unchanged(
+    meta: &IndexMeta,
+    current_hashes: &BTreeMap<String, String>,
+    current_source_root_from_index: &str,
+) -> bool {
+    meta.file_hashes == *current_hashes
+        && meta.source_root_from_index == current_source_root_from_index
+}
+
+/// Record the source root relative to the index location, not the process CWD.
+fn relative_source_root(index_dir: &Path, source_root: &Path) -> Result<String> {
+    let index_dir = index_dir.canonicalize()?;
+    let source_root = source_root.canonicalize()?;
+    let from: Vec<_> = index_dir.components().collect();
+    let to: Vec<_> = source_root.components().collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return Ok(source_root.to_string_lossy().into_owned());
+    }
+    let mut relative = PathBuf::new();
+    for _ in common..from.len() {
+        relative.push("..");
+    }
+    for component in &to[common..] {
+        relative.push(component.as_os_str());
+    }
+    Ok(normalized_metadata_path(&relative))
 }
 
 /// Build every index declared in a `rag.toml` config file.
@@ -723,6 +857,7 @@ fn full_index(
     let mut occurrences = Vec::with_capacity(all_chunks.len());
 
     for (chunk, text_id) in all_chunks.into_iter().zip(text_ids) {
+        let byte_len = chunk.text.len();
         let source_id = if let Some(&id) = source_ids.get(&chunk.source) {
             id
         } else {
@@ -741,6 +876,7 @@ fn full_index(
             source_id,
             text_id: u32::try_from(text_id).context("Too many unique chunks")?,
             byte_offset: chunk.byte_offset,
+            byte_len,
         });
     }
 
@@ -814,14 +950,11 @@ fn incremental_index(
         .enumerate()
         .map(|(id, source)| (source.path.clone(), id as u32))
         .collect();
-    // Hash all retained text so changed files can reuse vectors from unchanged
-    // files. Persisting a 32-byte hash per text would enlarge every index;
-    // rebuilding this map is cheap relative to loading index.bin (the measured
-    // 204k-text no-op path remains under 0.4s and bypasses this function).
-    let mut text_ids: HashMap<blake3::Hash, u32> = texts
+    // Retained hashes let changed files reuse vectors from unchanged files.
+    let mut text_ids: HashMap<[u8; 32], u32> = texts
         .iter()
         .enumerate()
-        .map(|(id, text)| (blake3::hash(text.text.as_bytes()), id as u32))
+        .map(|(id, text)| (text.text_hash, id as u32))
         .collect();
     let mut new_text_ids = Vec::new();
 
@@ -835,6 +968,7 @@ fn incremental_index(
         };
 
         for chunk in new_chunks {
+            let byte_len = chunk.text.len();
             let source_id = if let Some(&id) = source_ids.get(&chunk.source) {
                 id
             } else {
@@ -844,14 +978,8 @@ fn incremental_index(
                 id
             };
 
-            let text_hash = blake3::hash(chunk.text.as_bytes());
+            let text_hash = *blake3::hash(chunk.text.as_bytes()).as_bytes();
             let text_id = if let Some(&id) = text_ids.get(&text_hash) {
-                let existing = texts
-                    .get(id as usize)
-                    .context("Text lookup references an invalid text ID")?;
-                if existing.text != chunk.text {
-                    anyhow::bail!("Blake3 collision while deduplicating chunk text");
-                }
                 id
             } else {
                 let id = u32::try_from(texts.len()).context("Too many unique chunks")?;
@@ -865,6 +993,7 @@ fn incremental_index(
                 source_id,
                 text_id,
                 byte_offset: chunk.byte_offset,
+                byte_len,
             });
         }
     }
@@ -977,9 +1106,8 @@ enum FederatedSourceIdentity {
     /// Absolute metadata roots can be compared across independently stored
     /// indexes. Canonicalization also collapses symlink aliases when possible.
     Canonical(PathBuf),
-    /// Relative metadata roots do not record what directory they were relative
-    /// to when the index was built. Scope them to the index rather than risk
-    /// merging unrelated files that happen to have the same relative name.
+    /// Keep relative metadata roots scoped to an index for stable grouping
+    /// semantics across indexes with the same source labels.
     IndexScoped {
         index_path: PathBuf,
         root_dir: PathBuf,
@@ -995,6 +1123,8 @@ struct FederatedSearchResult {
     source: String,
     score: f32,
     byte_offset: usize,
+    byte_len: usize,
+    text_hash: [u8; 32],
     text: String,
     index_order: usize,
     text_id: usize,
@@ -1011,10 +1141,9 @@ impl FederatedSearchResult {
                 canonical_source.canonicalize().unwrap_or(canonical_source),
             )
         } else {
-            // There is no reliable corpus anchor in old index metadata for a
-            // relative root (notably `.`). Make the index path absolute and
-            // canonical when possible so aliases of the same index still
-            // group, but separate index files remain separate namespaces.
+            // Make the index path absolute and canonical when possible so
+            // aliases of the same index group, while separate indexes retain
+            // their own source namespaces.
             let index_path = self.index_path.canonicalize().unwrap_or_else(|_| {
                 std::env::current_dir()
                     .map(|cwd| cwd.join(&self.index_path))
@@ -1244,7 +1373,12 @@ fn search_one_index(
                 .total_cmp(&results[a_rank].score)
                 .then_with(|| a_source.cmp(b_source))
                 .then_with(|| a_occurrence.byte_offset.cmp(&b_occurrence.byte_offset))
-                .then_with(|| results[a_rank].text.text.cmp(&results[b_rank].text.text))
+                .then_with(|| {
+                    results[a_rank]
+                        .text
+                        .text_hash
+                        .cmp(&results[b_rank].text.text_hash)
+                })
                 .then_with(|| results[a_rank].text_id.cmp(&results[b_rank].text_id))
         };
     for occurrence in &index.occurrences {
@@ -1316,6 +1450,8 @@ fn federated_result(
         source: source.path.clone(),
         score: result.score,
         byte_offset: occurrence.byte_offset,
+        byte_len: occurrence.byte_len,
+        text_hash: result.text.text_hash,
         text: result.text.text.clone(),
         index_order,
         text_id: result.text_id,
@@ -1333,7 +1469,7 @@ fn compare_federated_results(
         .then_with(|| a.root_dir.cmp(&b.root_dir))
         .then_with(|| a.source.cmp(&b.source))
         .then_with(|| a.byte_offset.cmp(&b.byte_offset))
-        .then_with(|| a.text.cmp(&b.text))
+        .then_with(|| a.text_hash.cmp(&b.text_hash))
         .then_with(|| a.index_path.cmp(&b.index_path))
         .then_with(|| a.index_name.cmp(&b.index_name))
         .then_with(|| a.index_order.cmp(&b.index_order))
@@ -1365,6 +1501,156 @@ fn merge_federated_results(
     limit_federated_results(results, top_k)
 }
 
+fn keyword_terms(query: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "and", "are", "for", "how", "in", "is", "of", "on", "or", "the", "to", "what",
+        "with",
+    ];
+    let mut seen = HashSet::new();
+    let terms: Vec<String> = query
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|term| term.chars().count() > 1)
+        .map(str::to_lowercase)
+        .filter(|term| !STOP_WORDS.contains(&term.as_str()) && seen.insert(term.clone()))
+        .collect();
+    if terms.is_empty() && !query.trim().is_empty() {
+        vec![query.trim().to_string()]
+    } else {
+        terms
+    }
+}
+
+fn keyword_one_index(
+    spec: &SearchIndexSpec,
+    index_order: usize,
+    index: &Index,
+    matcher: &grep_regex::RegexMatcher,
+    limit: usize,
+) -> Result<Vec<FederatedSearchResult>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let root = spec
+        .path
+        .canonicalize()
+        .with_context(|| format!("Index directory {} is unavailable", spec.path.display()))?
+        .join(&index.meta.source_root_from_index);
+    let mut by_source: Vec<Vec<usize>> = vec![Vec::new(); index.sources.len()];
+    for (occurrence_id, occurrence) in index.occurrences.iter().enumerate() {
+        by_source
+            .get_mut(occurrence.source_id as usize)
+            .context("Index occurrence references an invalid source ID")?
+            .push(occurrence_id);
+    }
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for (source_id, source) in index.sources.iter().enumerate() {
+        let occurrences = &mut by_source[source_id];
+        if occurrences.is_empty() {
+            continue;
+        }
+        let path = root.join(&source.path);
+        let hits = keyword::scan_file(matcher, &path, false)?;
+        if hits.is_empty() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "Source {} is unavailable; rebuild the index",
+                path.display()
+            )
+        })?;
+        let expected =
+            index.meta.file_hashes.get(&source.path).with_context(|| {
+                format!("Index has no hash for source {}; rebuild it", source.path)
+            })?;
+        if blake3::hash(&bytes).to_hex().as_str() != expected {
+            anyhow::bail!(
+                "Source {} changed since indexing; rebuild the index",
+                path.display()
+            );
+        }
+        occurrences.sort_unstable_by_key(|&id| index.occurrences[id].byte_offset);
+        let max_len = occurrences
+            .iter()
+            .map(|&id| index.occurrences[id].byte_len)
+            .max()
+            .unwrap_or(0);
+        for line in hits {
+            for span in line.spans {
+                let start = line.byte_offset + span.start;
+                let end = line.byte_offset + span.end;
+                let upper =
+                    occurrences.partition_point(|&id| index.occurrences[id].byte_offset <= start);
+                let lower = occurrences[..upper].partition_point(|&id| {
+                    index.occurrences[id].byte_offset.saturating_add(max_len) < end
+                });
+                for &id in &occurrences[lower..upper] {
+                    let occurrence = &index.occurrences[id];
+                    if occurrence.byte_offset.saturating_add(occurrence.byte_len) >= end {
+                        *counts.entry(id).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    let candidates = counts
+        .into_iter()
+        .map(|(occurrence_id, count)| {
+            let occurrence = &index.occurrences[occurrence_id];
+            let text_id = occurrence.text_id as usize;
+            let text = index
+                .texts
+                .get(text_id)
+                .context("Index occurrence references an invalid text ID")?;
+            let result = crate::index::SearchResult {
+                score: count as f32,
+                text_id,
+                text,
+            };
+            federated_result(spec, index_order, index, &result, occurrence)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(limit_federated_results(candidates, limit))
+}
+
+fn fuse_hybrid(
+    mut semantic: Vec<FederatedSearchResult>,
+    mut lexical: Vec<FederatedSearchResult>,
+    top_k: usize,
+    group_by_source: bool,
+) -> Vec<FederatedSearchResult> {
+    semantic.sort_by(compare_federated_results);
+    lexical.sort_by(compare_federated_results);
+    let mut fused: HashMap<(usize, String, usize, usize), FederatedSearchResult> = HashMap::new();
+    for (rank, mut result) in semantic.into_iter().enumerate() {
+        let key = (
+            result.index_order,
+            result.source.clone(),
+            result.byte_offset,
+            result.byte_len,
+        );
+        result.score = 1.0 / (60 + rank + 1) as f32;
+        fused.insert(key, result);
+    }
+    for (rank, result) in lexical.into_iter().enumerate() {
+        let key = (
+            result.index_order,
+            result.source.clone(),
+            result.byte_offset,
+            result.byte_len,
+        );
+        let contribution = 1.0 / (60 + rank + 1) as f32;
+        fused
+            .entry(key)
+            .and_modify(|existing| existing.score += contribution)
+            .or_insert_with(|| FederatedSearchResult {
+                score: contribution,
+                ..result
+            });
+    }
+    merge_federated_results(fused.into_values().collect(), top_k, group_by_source)
+}
+
 fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
     let SearchSettings {
         query,
@@ -1374,6 +1660,7 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
         top_k,
         model_override,
         group_by_source,
+        hybrid,
         full,
         json,
         cache_dir,
@@ -1409,9 +1696,16 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
     }
     let embed_time = start.elapsed();
 
+    let keyword_matcher = if hybrid {
+        Some(keyword::matcher(&keyword_terms(query), true, true)?)
+    } else {
+        None
+    };
+
     // Search sequentially so peak memory is bounded by the largest index rather
     // than the sum of every federated index.
     let mut candidates = Vec::with_capacity(specs.len().saturating_mul(top_k));
+    let mut keyword_candidates = Vec::new();
     for (index_order, (spec, expected_meta)) in specs.iter().zip(&metas).enumerate() {
         let index = Index::load(&spec.path)
             .with_context(|| format!("Failed to load federated index {}", spec.path.display()))?;
@@ -1431,11 +1725,29 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
             index_order,
             &index,
             &query_embedding,
-            top_k,
+            if hybrid {
+                top_k.saturating_mul(10)
+            } else {
+                top_k
+            },
             group_by_source,
         )?);
+        if let Some(matcher) = &keyword_matcher {
+            keyword_candidates.extend(keyword_one_index(
+                spec,
+                index_order,
+                &index,
+                matcher,
+                top_k.saturating_mul(10),
+            )?);
+        }
     }
-    let results = merge_federated_results(candidates, top_k, group_by_source);
+    let mut results = if hybrid {
+        fuse_hybrid(candidates, keyword_candidates, top_k, group_by_source)
+    } else {
+        merge_federated_results(candidates, top_k, group_by_source)
+    };
+    hydrate_results(&mut results, &specs, &metas)?;
     let search_time = start.elapsed();
 
     if json {
@@ -1501,6 +1813,71 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Read only winning chunks. Whole-file hashes reject results from changed
+/// sources, since their stored vectors may no longer describe the source.
+fn hydrate_results(
+    results: &mut [FederatedSearchResult],
+    specs: &[SearchIndexSpec],
+    metas: &[IndexMeta],
+) -> Result<()> {
+    let mut files: HashMap<PathBuf, (Vec<u8>, String)> = HashMap::new();
+    for result in results {
+        let spec = specs
+            .get(result.index_order)
+            .context("Search result references an invalid index")?;
+        let meta = metas
+            .get(result.index_order)
+            .context("Search result references missing index metadata")?;
+        let index_path = spec
+            .path
+            .canonicalize()
+            .with_context(|| format!("Index directory {} is unavailable", spec.path.display()))?;
+        let source_path = index_path
+            .join(&meta.source_root_from_index)
+            .join(&result.source);
+        if !files.contains_key(&source_path) {
+            let bytes = std::fs::read(&source_path).with_context(|| {
+                format!(
+                    "Source {} is unavailable; restore it or rebuild the index",
+                    source_path.display()
+                )
+            })?;
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            files.insert(source_path.clone(), (bytes, hash));
+        }
+        let (bytes, hash) = files.get(&source_path).expect("just loaded source");
+        let expected = meta.file_hashes.get(&result.source).with_context(|| {
+            format!("Index has no hash for source {}; rebuild it", result.source)
+        })?;
+        if hash != expected {
+            anyhow::bail!(
+                "Source {} changed since indexing; rebuild the index",
+                source_path.display()
+            );
+        }
+        let end = result
+            .byte_offset
+            .checked_add(result.byte_len)
+            .context("Indexed chunk range overflows")?;
+        let chunk = bytes.get(result.byte_offset..end).with_context(|| {
+            format!(
+                "Invalid chunk range in {}; rebuild the index",
+                source_path.display()
+            )
+        })?;
+        if blake3::hash(chunk).as_bytes() != &result.text_hash {
+            anyhow::bail!(
+                "Chunk in {} differs from the index; rebuild it",
+                source_path.display()
+            );
+        }
+        result.text = std::str::from_utf8(chunk)
+            .with_context(|| format!("Indexed chunk in {} is not UTF-8", source_path.display()))?
+            .to_string();
+    }
     Ok(())
 }
 
@@ -1591,8 +1968,9 @@ fn chrono_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_records, ignored_config_options_warning, merge_federated_results,
-        normalized_metadata_path, resolve_download_models_from_dir,
+        compact_records, fuse_hybrid, hydrate_results, ignored_config_options_warning,
+        index_files_and_source_unchanged, keyword_one_index, merge_federated_results,
+        normalized_metadata_path, relative_source_root, resolve_download_models_from_dir,
         resolve_search_indexes_from_dir, search_one_index, unique_text_plan,
         validate_chunk_settings, validate_search_metadata, Cli, Commands, FederatedSearchResult,
         SearchIndexSpec, DEFAULT_MODEL,
@@ -1621,6 +1999,7 @@ mod tests {
             num_chunks: 1,
             num_unique_texts: 1,
             root_dir: "/docs".into(),
+            source_root_from_index: ".".into(),
             created_at: "now".into(),
             chunk_size: 512,
             chunk_overlap: 64,
@@ -1639,6 +2018,119 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn search_reads_exact_chunk_from_source_and_rejects_stale_file() {
+        let workspace = temp_dir("rag-source-backed");
+        let source_root = workspace.join("docs");
+        let index_dir = workspace.join(".rag/docs");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let original = "  αα\n\n  beta  \n";
+        let source_path = source_root.join("a.md");
+        std::fs::write(&source_path, original).unwrap();
+        let mut metadata = meta("model", 2);
+        metadata.source_root_from_index = relative_source_root(&index_dir, &source_root).unwrap();
+        metadata.file_hashes.insert(
+            "a.md".into(),
+            blake3::hash(original.as_bytes()).to_hex().to_string(),
+        );
+        let index = Index::new(
+            metadata.clone(),
+            vec![SourceRecord {
+                path: "a.md".into(),
+            }],
+            vec![TextRecord::new("beta".into(), vec![1.0, 0.0])],
+            vec![ChunkOccurrence {
+                source_id: 0,
+                text_id: 0,
+                byte_offset: original.find("beta").unwrap(),
+                byte_len: 4,
+            }],
+        );
+        index.save(&index_dir).unwrap();
+        let spec = SearchIndexSpec {
+            name: None,
+            path: index_dir,
+        };
+        let loaded = Index::load(&spec.path).unwrap();
+        assert!(loaded.texts[0].text.is_empty());
+        let mut hits = search_one_index(&spec, 0, &loaded, &[1.0, 0.0], 1, false).unwrap();
+        hydrate_results(
+            &mut hits,
+            std::slice::from_ref(&spec),
+            std::slice::from_ref(&metadata),
+        )
+        .unwrap();
+        assert_eq!(hits[0].text, "beta");
+
+        std::fs::write(&source_path, "  αα\n\n  changed  \n").unwrap();
+        assert!(hydrate_results(&mut hits, &[spec], &[metadata])
+            .unwrap_err()
+            .to_string()
+            .contains("changed since indexing"));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn keyword_hits_map_to_each_overlapping_chunk() {
+        let workspace = temp_dir("rag-hybrid-overlap");
+        let source_root = workspace.join("docs");
+        let index_dir = workspace.join(".rag/docs");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let body = "alpha beta alpha";
+        std::fs::write(source_root.join("a.md"), body).unwrap();
+        let mut metadata = meta("model", 2);
+        metadata.source_root_from_index = relative_source_root(&index_dir, &source_root).unwrap();
+        metadata.file_hashes.insert(
+            "a.md".into(),
+            blake3::hash(body.as_bytes()).to_hex().to_string(),
+        );
+        let index = Index::new(
+            metadata,
+            vec![SourceRecord {
+                path: "a.md".into(),
+            }],
+            vec![
+                TextRecord::new("alpha beta".into(), vec![1.0, 0.0]),
+                TextRecord::new("beta alpha".into(), vec![0.0, 1.0]),
+            ],
+            vec![
+                ChunkOccurrence {
+                    source_id: 0,
+                    text_id: 0,
+                    byte_offset: 0,
+                    byte_len: 10,
+                },
+                ChunkOccurrence {
+                    source_id: 0,
+                    text_id: 1,
+                    byte_offset: 6,
+                    byte_len: 10,
+                },
+            ],
+        );
+        let spec = SearchIndexSpec {
+            name: None,
+            path: index_dir,
+        };
+        let matcher = crate::keyword::matcher(&["beta".into()], true, true).unwrap();
+        let hits = keyword_one_index(&spec, 0, &index, &matcher, 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].byte_offset, 0);
+        assert_eq!(hits[1].byte_offset, 6);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn hybrid_fusion_promotes_a_result_found_by_both_methods() {
+        let semantic = vec![result(0.9, 0, 0), result(0.8, 0, 1)];
+        let lexical = vec![result(3.0, 0, 1), result(2.0, 0, 2)];
+        let fused = fuse_hybrid(semantic, lexical, 3, false);
+        assert_eq!(fused[0].text_id, 1);
+        assert!(fused[0].score > fused[1].score);
+    }
+
     fn result(score: f32, index_order: usize, text_id: usize) -> FederatedSearchResult {
         FederatedSearchResult {
             index_name: None,
@@ -1647,6 +2139,8 @@ mod tests {
             source: format!("{text_id}.md"),
             score,
             byte_offset: 0,
+            byte_len: 0,
+            text_hash: *blake3::hash(format!("text {text_id}").as_bytes()).as_bytes(),
             text: format!("text {text_id}"),
             index_order,
             text_id,
@@ -1992,26 +2486,31 @@ mod tests {
                     source_id: 0,
                     text_id: 0,
                     byte_offset: 0,
+                    byte_len: 0,
                 },
                 ChunkOccurrence {
                     source_id: 0,
                     text_id: 1,
                     byte_offset: 10,
+                    byte_len: 0,
                 },
                 ChunkOccurrence {
                     source_id: 0,
                     text_id: 2,
                     byte_offset: 20,
+                    byte_len: 0,
                 },
                 ChunkOccurrence {
                     source_id: 1,
                     text_id: 3,
                     byte_offset: 30,
+                    byte_len: 0,
                 },
                 ChunkOccurrence {
                     source_id: 2,
                     text_id: 4,
                     byte_offset: 40,
+                    byte_len: 0,
                 },
             ],
         );
@@ -2051,11 +2550,13 @@ mod tests {
                     source_id: 0,
                     text_id: 0,
                     byte_offset: 11,
+                    byte_len: 0,
                 },
                 ChunkOccurrence {
                     source_id: 1,
                     text_id: 0,
                     byte_offset: 22,
+                    byte_len: 0,
                 },
             ],
         );
@@ -2096,11 +2597,13 @@ mod tests {
                     source_id: 0,
                     text_id: 0,
                     byte_offset: 5,
+                    byte_len: 0,
                 },
                 ChunkOccurrence {
                     source_id: 0,
                     text_id: 1,
                     byte_offset: 50,
+                    byte_len: 0,
                 },
             ],
         );
@@ -2150,16 +2653,19 @@ mod tests {
                         source_id: 0,
                         text_id: 0,
                         byte_offset: 20,
+                        byte_len: 0,
                     },
                     ChunkOccurrence {
                         source_id: 1,
                         text_id: 1,
                         byte_offset: 10,
+                        byte_len: 0,
                     },
                     ChunkOccurrence {
                         source_id: 2,
                         text_id: 2,
                         byte_offset: 30,
+                        byte_len: 0,
                     },
                 ],
             )
@@ -2246,6 +2752,7 @@ mod tests {
                 source_id: 0,
                 text_id: 0,
                 byte_offset,
+                byte_len: 0,
             })
             .collect();
         let index = Index::new(
@@ -2378,6 +2885,24 @@ mod tests {
     }
 
     #[test]
+    fn matching_file_hashes_do_not_hide_a_changed_source_root() {
+        let mut metadata = meta("m", 2);
+        metadata.file_hashes.insert("a.md".into(), "same".into());
+        metadata.source_root_from_index = "../old-checkout/docs".into();
+
+        assert!(!index_files_and_source_unchanged(
+            &metadata,
+            &metadata.file_hashes,
+            "../new-checkout/docs",
+        ));
+        assert!(index_files_and_source_unchanged(
+            &metadata,
+            &metadata.file_hashes,
+            "../old-checkout/docs",
+        ));
+    }
+
+    #[test]
     fn unique_text_plan_reuses_duplicate_ids_in_input_order() {
         let input = ["alpha", "beta", "alpha", "gamma", "beta"];
         let (unique, ids) = unique_text_plan(input.into_iter());
@@ -2404,6 +2929,7 @@ mod tests {
             source_id: 1,
             text_id: 1,
             byte_offset: 42,
+            byte_len: 0,
         }];
 
         compact_records(&mut sources, &mut texts, &mut occurrences)
@@ -2426,6 +2952,7 @@ mod tests {
             source_id: 0,
             text_id: 0,
             byte_offset: 0,
+            byte_len: 0,
         }];
 
         let error = compact_records(&mut sources, &mut texts, &mut occurrences)

@@ -40,6 +40,11 @@ blake3 = "1"
 anyhow = "1"
 indicatif = "0.17"
 walkdir = "2"
+grep-searcher = "0.1.17"
+grep-regex = "0.1.14"
+grep-matcher = "0.1.9"
+ignore = "0.4.33"
+regex = "1.12.3"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 coreml-native = "=0.2.0"

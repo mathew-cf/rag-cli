@@ -69,7 +69,8 @@ the model or chunk settings — or when a rag-cli upgrade changes the embedding
 backend/precision or on-disk format — the entire index is rebuilt automatically.
 A no-change run checks the small metadata file and does not load or rewrite the
 full index. Changed files reuse embeddings for chunk text already present in the
-index.
+index. Search reads matching chunks from the original files, so those files must
+remain available and unchanged until the index is rebuilt.
 
 #### Config file (`rag.toml`)
 
@@ -126,6 +127,9 @@ rag search "cache behavior" --config path/to/rag.toml
 ### `rag search <query>`
 
 Embeds your query and returns the most similar chunks by cosine similarity.
+Add `--hybrid` to combine semantic ranking with live keyword matches from the
+indexed source files. Hybrid result scores are reciprocal-rank-fusion scores,
+not cosine similarities.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -135,6 +139,7 @@ Embeds your query and returns the most similar chunks by cosine similarity.
 | `-k, --top-k <n>` | `5` | Number of results across all indexes |
 | `-m, --model <id>` | *(from index)* | Override embedding model; must match the indexes |
 | `--group-by-source` | off | Return at most one result from each source file |
+| `--hybrid` | off | Combine semantic and live keyword ranking across selected indexes |
 | `--full` | off | Show full chunk text instead of truncated preview |
 | `--json` | off | Output compact JSON (for piping to LLMs or other tools) |
 
@@ -147,16 +152,16 @@ high-scoring chunks from one file:
 
 ```bash
 rag search "cache behavior" --top-k 5 --group-by-source
+rag search "cache behavior" --hybrid --top-k 5
 ```
 
 In this mode, rag-cli considers a bounded window of up to 10 times `--top-k`
 semantic candidates in each index and keeps each source's best occurrence from
 that window. Federated results are then grouped globally. Sources under absolute
 `root_dir` values overlap by canonical root and source path, so only the best
-result is retained. A relative `root_dir` (such as `.`) cannot be resolved
-reliably from portable index metadata, so its identity is scoped to that index;
-this avoids merging unrelated same-named files from indexes built in different
-directories. Per-index source candidates are also overfetched
+result is retained. A relative `root_dir` (such as `.`) remains scoped to its
+index for source grouping, so unrelated same-named files from different indexes
+stay separate. Per-index source candidates are also overfetched
 (up to the same bound) so the global merge can refill slots removed by overlap.
 If the bounded windows contain fewer than `k` distinct canonical sources, fewer
 than `k` results are returned. Identical chunk text occurring in several files
@@ -188,6 +193,21 @@ fields let callers resolve a relative source path against the correct corpus.
 When an index was built from a relative CLI or `rag.toml` path, `root_dir`
 preserves that relative path rather than exposing the builder's absolute path.
 
+### `rag keyword`
+
+Search live files without loading an embedding model. Patterns passed with `-e`
+are ORed and treated as regular expressions by default. Add `-F` for literal
+strings, `-i` to ignore case, and `-l` to print only matching file paths.
+`--glob` accepts ripgrep-style include and exclude patterns; git ignore and
+hidden-file rules apply during directory walking.
+
+```bash
+rag keyword -e retry -e backoff docs --glob '*.md' -l
+rag keyword -F -i -e 'error.code' sessions --glob '*.jsonl' -l
+```
+
+Exit status is 0 when files match, 1 when none match, and 2 on an error.
+
 ### `rag info`
 
 Prints index metadata: format, model, chunk and unique-text counts, duplicate
@@ -215,8 +235,10 @@ immutable Hugging Face revision. The ONNX Runtime library remains statically
 linked for non-Apple builds, so there is nothing to install separately.
 
 Persisted vectors use F16 independently of int8 model inference. Exact duplicate
-chunk text is embedded and stored once, while compact occurrence records retain
-every source and byte offset. Search decodes F16 values for exact cosine scoring.
+chunk text is embedded once. The index stores one vector and content hash per
+unique chunk, plus compact source and byte-range records for each occurrence.
+Search decodes F16 values for exact cosine scoring, then reads the winning
+chunks from their source files and checks that those files have not changed.
 
 ## Model management
 
@@ -286,11 +308,11 @@ skipped directory back in with `--include`.
    paragraph or line boundaries when possible
 3. **Deduplicate and embed** each unique chunk body once, in batches of 128,
    using `all-MiniLM-L6-v2` with mean pooling and L2 normalization
-4. **Store** one F16 vector and one text body per unique chunk, plus compact
-   source/offset occurrence records, in `.rag/index.bin`; inference remains
+4. **Store** one F16 vector and content hash per unique chunk, plus compact
+   source/byte-range occurrence records, in `.rag/index.bin`; inference remains
    int8 with f32 output, so F16 applies only to persisted vectors
 5. **Search** by embedding the query with the same model and ranking unique
-   chunk bodies by exact cosine similarity
+   chunk bodies by exact cosine similarity, then reading matches from source files
 
 ## License
 

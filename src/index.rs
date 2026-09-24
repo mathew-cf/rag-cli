@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-pub const INDEX_FORMAT_VERSION: u32 = 2;
+pub const INDEX_FORMAT_VERSION: u32 = 3;
 
 /// A source file referenced by one or more chunk occurrences.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -22,6 +22,10 @@ pub struct SourceRecord {
 /// f32 vectors; only the persisted representation is quantized.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TextRecord {
+    /// Identifies the original bytes without retaining the chunk body on disk.
+    pub text_hash: [u8; 32],
+    /// Available while building an index; search loads text from source files.
+    #[serde(skip)]
     pub text: String,
     pub embedding_f16: Vec<u16>,
     /// L2 norm after decoding the stored F16 values, used for exact cosine.
@@ -41,6 +45,7 @@ impl TextRecord {
             .sqrt();
         let embedding_f16 = half_values.reinterpret_into();
         Self {
+            text_hash: *blake3::hash(text.as_bytes()).as_bytes(),
             text,
             embedding_f16,
             embedding_norm,
@@ -49,6 +54,7 @@ impl TextRecord {
 
     pub fn without_embedding(text: String) -> Self {
         Self {
+            text_hash: *blake3::hash(text.as_bytes()).as_bytes(),
             text,
             embedding_f16: Vec::new(),
             embedding_norm: 0.0,
@@ -67,6 +73,7 @@ pub struct ChunkOccurrence {
     pub source_id: u32,
     pub text_id: u32,
     pub byte_offset: usize,
+    pub byte_len: usize,
 }
 
 /// Metadata stored alongside the index.
@@ -90,6 +97,9 @@ pub struct IndexMeta {
     /// Root directory that was indexed. Relative CLI and config paths remain
     /// relative so committed metadata is portable across machines.
     pub root_dir: String,
+    /// Source root relative to the index directory, so moved repositories work.
+    #[serde(default)]
+    pub source_root_from_index: String,
     /// Timestamp of index creation.
     pub created_at: String,
     /// Chunk size in characters used during indexing.
@@ -248,6 +258,14 @@ impl Index {
             .with_context(|| format!("Failed to open {}", meta_path.display()))?;
         let metadata: IndexMeta = serde_json::from_reader(BufReader::new(file))
             .with_context(|| format!("Failed to deserialize {}", meta_path.display()))?;
+        if metadata.format_version != INDEX_FORMAT_VERSION {
+            anyhow::bail!(
+                "Index {} uses format v{}, but this binary requires v{}; rebuild it",
+                dir.display(),
+                metadata.format_version,
+                INDEX_FORMAT_VERSION
+            );
+        }
 
         let index_path = dir.join("index.bin");
         let index_file = std::fs::File::open(&index_path)
@@ -367,11 +385,24 @@ mod tests {
             num_chunks: 0,
             num_unique_texts: 0,
             root_dir: "/tmp".to_string(),
+            source_root_from_index: ".".to_string(),
             created_at: "now".to_string(),
             chunk_size: 512,
             chunk_overlap: 64,
             file_hashes: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn serialized_record_omits_chunk_text() {
+        let record = TextRecord::new("private chunk body".into(), vec![1.0, 0.0]);
+        let bytes = bincode::serialize(&record).unwrap();
+        assert!(!bytes
+            .windows(record.text.len())
+            .any(|window| window == record.text.as_bytes()));
+        let restored: TextRecord = bincode::deserialize(&bytes).unwrap();
+        assert!(restored.text.is_empty());
+        assert_eq!(restored.text_hash, record.text_hash);
     }
 
     #[test]

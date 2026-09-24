@@ -230,7 +230,9 @@ pub fn chunk_file(
 /// Split text into overlapping chunks of approximately `chunk_size` characters.
 /// Tries to break at paragraph/line boundaries when possible.
 fn chunk_text(text: &str, source: &str, chunk_size: usize, chunk_overlap: usize) -> Vec<TextChunk> {
-    let text = text.trim();
+    let original = text;
+    let text = original.trim();
+    let trimmed_prefix = original.len() - original.trim_start().len();
     if text.is_empty() {
         return vec![];
     }
@@ -239,7 +241,7 @@ fn chunk_text(text: &str, source: &str, chunk_size: usize, chunk_overlap: usize)
     if text.len() <= chunk_size {
         return vec![TextChunk {
             source: source.to_string(),
-            byte_offset: 0,
+            byte_offset: trimmed_prefix,
             text: text.to_string(),
         }];
     }
@@ -271,9 +273,10 @@ fn chunk_text(text: &str, source: &str, chunk_size: usize, chunk_overlap: usize)
 
         let chunk_text = text[start..end].trim();
         if !chunk_text.is_empty() {
+            let leading_space = text[start..end].len() - text[start..end].trim_start().len();
             chunks.push(TextChunk {
                 source: source.to_string(),
-                byte_offset: start,
+                byte_offset: trimmed_prefix + start + leading_space,
                 text: chunk_text.to_string(),
             });
         }
@@ -333,6 +336,20 @@ mod tests {
         let text = "a".repeat(500) + "\n\n" + &"b".repeat(500);
         let chunks = chunk_text(&text, "test.txt", 600, 50);
         assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn chunk_offsets_address_exact_original_file_bytes() {
+        let original = "  αα\n\n  beta  \n\n gamma  ";
+        let chunks = chunk_text(original, "test.txt", 10, 2);
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            let end = chunk.byte_offset + chunk.text.len();
+            assert_eq!(
+                original.get(chunk.byte_offset..end),
+                Some(chunk.text.as_str())
+            );
+        }
     }
 
     #[test]
