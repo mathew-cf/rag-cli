@@ -39,7 +39,6 @@ blake3 = "1"
 # Utilities
 anyhow = "1"
 indicatif = "0.17"
-walkdir = "2"
 grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
 grep-matcher = "0.1.9"

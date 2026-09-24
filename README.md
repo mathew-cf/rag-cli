@@ -53,6 +53,8 @@ computes embeddings, and writes the index to disk. With **no path**, reads a
 | `--ext <list>` | — | Extra file extensions to index, beyond the built-in allowlist (comma-separated or repeated), e.g. `--ext mdx,rst` |
 | `--exclude <list>` | — | Directory/file specs to skip (comma-separated or repeated) |
 | `--include <list>` | — | Normally-skipped directories to index anyway, e.g. `--include dist` |
+| `--no-ignore` | off | Include files ignored by `.gitignore`, `.ignore`, and Git excludes |
+| `--hidden` | off | Include hidden source directories |
 | `-c, --config <file>` | `rag.toml` | Config file to build from when no path is given |
 | `--only <list>` | — | In config mode, build only these named indexes (skip slow ones you didn't change) |
 
@@ -61,6 +63,11 @@ name (e.g. `changelog` skips every `changelog/` directory). A spec containing a
 `/` is treated as a relative-path prefix (e.g. `src/content/changelog` skips
 only that one). `--include` re-enables directories that are skipped by default
 (`node_modules`, `dist`, `build`, `vendor`, `target`, hidden dirs, …).
+File discovery also respects `.gitignore`, `.ignore`, `.rgignore`, Git excludes, and global
+ignore rules by default. `--no-ignore` disables those ignore files; `--hidden`
+includes hidden directories. These two switches work for a single path or all
+selected `rag.toml` entries. Per-entry `no_ignore` and `hidden` values override
+the global config defaults; CLI switches can turn either behavior on for a run.
 
 Re-running `rag index` on the same directory performs **incremental indexing** —
 only changed or new files are re-embedded. File changes are detected using
@@ -87,6 +94,13 @@ indexes do not contain machine-specific absolute paths.
 model = "sentence-transformers/all-MiniLM-L6-v2"
 chunk_size = 512
 chunk_overlap = 64
+no_ignore = false             # optional; default respects ignore files
+hidden = false                # optional; default skips hidden directories
+
+[search]
+hybrid = true                  # optional default for rag search
+semantic_weight = 1.0          # relative RRF contribution
+keyword_weight = 2.0
 
 [[index]]
 name = "docs"                  # output defaults to .rag/<name>
@@ -94,6 +108,8 @@ path = "docs/src/content"      # relative to this config file
 extensions = ["mdx"]           # extra extensions beyond the built-in allowlist
 exclude = ["changelog"]        # skip these dirs/files
 # include = ["dist"]           # re-include normally-skipped dirs
+# no_ignore = true            # override the global ignore-file default
+# hidden = true               # override the global hidden-dir default
 # output = ".rag/docs"         # override the default output dir
 
 [[index]]
@@ -101,9 +117,25 @@ name = "reference"
 path = "reference/md"
 ```
 
+With this config in the current directory:
+
+| Command | Default scope | One-off selection |
+|---------|---------------|-------------------|
+| `rag index` | Build every `[[index]]` | `--only docs` |
+| `rag search "query"` | Search every configured index | `--only docs` or repeat `--index` |
+| `rag search "query" --hybrid` | Semantic and live keyword ranking over every configured index | `--only docs` |
+| `rag keyword -e term` | Scan every configured source directory live | `--only docs` or give a path |
+| `rag info` | Show every configured index | `--only docs` |
+
+`rag search` and `rag info` require every selected index to have been built.
+After `rag index --only docs`, use `--only docs` for those commands until the
+other indexes are built. `rag keyword` scans source files and works before indexing.
+
 `rag index` looks for `rag.toml` then `.rag.toml` in the current directory, or
 use `--config <file>`. To rebuild just some of the declared indexes, use
 `--only`: `rag index --only docs`.
+The optional `[search]` table sets defaults for `rag search` without changing
+the stored indexes. CLI search options override these defaults.
 
 Indexes can live in the root repository while their source directories are Git
 submodules. This keeps generated data out of the submodules and lets each corpus
@@ -129,7 +161,10 @@ rag search "cache behavior" --config path/to/rag.toml
 Embeds your query and returns the most similar chunks by cosine similarity.
 Add `--hybrid` to combine semantic ranking with live keyword matches from the
 indexed source files. Hybrid result scores are reciprocal-rank-fusion scores,
-not cosine similarities.
+not cosine similarities. Without extra options, the two rankings have equal
+weight and keywords are extracted from the query. Hybrid search considers
+files recorded in the index; run `rag index` after adding files or changing
+file-selection rules so they join the hybrid corpus.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -139,7 +174,11 @@ not cosine similarities.
 | `-k, --top-k <n>` | `5` | Number of results across all indexes |
 | `-m, --model <id>` | *(from index)* | Override embedding model; must match the indexes |
 | `--group-by-source` | off | Return at most one result from each source file |
-| `--hybrid` | off | Combine semantic and live keyword ranking across selected indexes |
+| `--hybrid` | off or `rag.toml` | Combine semantic and live keyword ranking across selected indexes |
+| `--no-hybrid` | off | Use semantic ranking only, overriding `rag.toml` |
+| `--semantic-weight <n>` | `1` or `rag.toml` | Relative contribution of semantic ranking; implies `--hybrid` |
+| `--keyword-weight <n>` | `1` or `rag.toml` | Relative contribution of keyword ranking; implies `--hybrid` |
+| `--keyword <text>` | *(query terms)* | Literal keyword or phrase; repeat to match any; implies `--hybrid` |
 | `--full` | off | Show full chunk text instead of truncated preview |
 | `--json` | off | Output compact JSON (for piping to LLMs or other tools) |
 
@@ -153,9 +192,19 @@ high-scoring chunks from one file:
 ```bash
 rag search "cache behavior" --top-k 5 --group-by-source
 rag search "cache behavior" --hybrid --top-k 5
+rag search "why do cache entries expire" --keyword TTL --keyword eviction --keyword-weight 2
 ```
 
-In this mode, rag-cli considers a bounded window of up to 10 times `--top-k`
+Weights must be positive finite numbers; their ratio determines the relative
+influence of each ranking. `--keyword` replaces the automatically extracted
+terms, so a phrase such as `--keyword "cache miss"` matches those words together.
+The command searches every index in `rag.toml` unless `--only` narrows the set.
+`[search]` can set `hybrid`, `semantic_weight`, and `keyword_weight` for routine
+queries. `--hybrid`, `--keyword`, or either weight flag enables hybrid search
+for one command; `--no-hybrid` switches back to semantic search. An explicit
+`--index` uses the named index paths without loading `rag.toml` defaults.
+
+With `--group-by-source`, rag-cli considers a bounded window of up to 10 times `--top-k`
 semantic candidates in each index and keeps each source's best occurrence from
 that window. Federated results are then grouped globally. Sources under absolute
 `root_dir` values overlap by canonical root and source path, so only the best
@@ -198,13 +247,26 @@ preserves that relative path rather than exposing the builder's absolute path.
 Search live files without loading an embedding model. Patterns passed with `-e`
 are ORed and treated as regular expressions by default. Add `-F` for literal
 strings, `-i` to ignore case, and `-l` to print only matching file paths.
-`--glob` accepts ripgrep-style include and exclude patterns; git ignore and
-hidden-file rules apply during directory walking.
+`--glob` accepts ripgrep-style include and exclude patterns and overrides
+ignore-file rules as in ripgrep. By default the walker respects `.gitignore`,
+`.ignore`, `.rgignore`, Git excludes, and hidden-file rules; `--no-ignore` and `--hidden`
+relax those rules separately. With no path, `rag keyword`
+searches every source directory in `rag.toml` or `.rag.toml`; use `--only` to
+select names or `--config` to choose another file. If there is no config, it
+searches the current directory. An explicit path searches just that path.
 
 ```bash
 rag keyword -e retry -e backoff docs --glob '*.md' -l
 rag keyword -F -i -e 'error.code' sessions --glob '*.jsonl' -l
+rag keyword -e cache --only docs,reference -l   # source dirs from rag.toml
 ```
+
+Config-based keyword search scans live files under the selected source paths
+using each entry's extensions, include/exclude, and ignore settings. It does
+not require the indexes to be built. `--glob` narrows that configured corpus;
+it can override ignore files but not an entry's explicit `exclude` rule. An
+explicit path scans all file types unless `--glob` narrows them. Results
+identify files by path, including their source directory.
 
 Exit status is 0 when files match, 1 when none match, and 2 on an error.
 

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
+use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::path::Path;
-use walkdir::WalkDir;
+use std::path::{Path, PathBuf};
 
 /// Text file extensions we'll index.
 ///
@@ -106,6 +106,20 @@ pub struct DiscoveryConfig {
     /// Specs matching normally-skipped directories (defaults or hidden) that
     /// should be indexed anyway.
     pub include: Vec<String>,
+    /// Search files ignored by .gitignore, .ignore, .rgignore, git excludes, and global ignores.
+    pub no_ignore: bool,
+    /// Include hidden directories as well as ordinary directories.
+    pub hidden: bool,
+}
+
+/// Options for the shared source walker. A discovery config applies the same
+/// corpus rules to indexing and config-based live keyword search.
+pub struct FileWalkOptions<'a> {
+    pub discovery: Option<&'a DiscoveryConfig>,
+    pub globs: &'a [String],
+    pub no_ignore: bool,
+    pub hidden: bool,
+    pub follow_links: bool,
 }
 
 /// Match a path spec against an entry. A spec containing `/` is treated as a
@@ -118,6 +132,110 @@ fn matches_spec(spec: &str, rel_path: &str, name: &str) -> bool {
     } else {
         name == spec
     }
+}
+
+fn discovery_entry_allowed(
+    root: &Path,
+    path: &Path,
+    is_dir: bool,
+    config: &DiscoveryConfig,
+    hidden: bool,
+) -> bool {
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if rel.is_empty() {
+        return true;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if config
+        .include
+        .iter()
+        .any(|spec| matches_spec(spec, &rel, &name))
+    {
+        return true;
+    }
+    if config
+        .exclude
+        .iter()
+        .any(|spec| matches_spec(spec, &rel, &name))
+    {
+        return false;
+    }
+    if !hidden && name.starts_with('.') {
+        return false;
+    }
+    !is_dir || !DEFAULT_SKIP_DIRS.contains(&name.as_ref())
+}
+
+fn indexable_file(path: &Path, extensions: &BTreeSet<String>) -> bool {
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    path.extension()
+        .is_some_and(|ext| extensions.contains(&ext.to_string_lossy().to_lowercase()))
+        || TEXT_FILENAMES.iter().any(|name| filename.as_ref() == *name)
+}
+
+/// Walk live files using ripgrep's ignore and glob rules. When `discovery` is
+/// present, also apply the index's extension and include/exclude rules.
+pub fn walk_files(root: &Path, options: &FileWalkOptions<'_>) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        anyhow::bail!("Search path {} does not exist", root.display());
+    }
+    let discovery = options.discovery.cloned();
+    let no_ignore = options.no_ignore || discovery.as_ref().is_some_and(|config| config.no_ignore);
+    let hidden = options.hidden || discovery.as_ref().is_some_and(|config| config.hidden);
+    let mut builder = WalkBuilder::new(root);
+    if !no_ignore {
+        builder.add_custom_ignore_filename(".rgignore");
+    }
+    builder.follow_links(options.follow_links);
+    builder
+        .parents(!no_ignore)
+        .ignore(!no_ignore)
+        .git_ignore(!no_ignore)
+        .git_global(!no_ignore)
+        .git_exclude(!no_ignore)
+        .hidden(options.discovery.is_none() && !hidden);
+    if !options.globs.is_empty() {
+        let mut overrides = OverrideBuilder::new(root);
+        for glob in options.globs {
+            overrides
+                .add(glob)
+                .with_context(|| format!("Invalid glob {glob:?}"))?;
+        }
+        builder.overrides(overrides.build()?);
+    }
+    if let Some(config) = discovery.as_ref() {
+        let config = config.clone();
+        let root = root.to_path_buf();
+        builder.filter_entry(move |entry| {
+            discovery_entry_allowed(
+                &root,
+                entry.path(),
+                entry.file_type().is_some_and(|kind| kind.is_dir()),
+                &config,
+                hidden,
+            )
+        });
+    }
+    let extensions = discovery
+        .as_ref()
+        .map(|config| build_extension_set(&config.extra_extensions));
+    let mut files = Vec::new();
+    for entry in builder.build() {
+        let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && extensions
+                .as_ref()
+                .is_none_or(|extensions| indexable_file(entry.path(), extensions))
+        {
+            files.push(entry.into_path());
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Chunk of text with metadata about where it came from.
@@ -136,76 +254,16 @@ pub struct TextChunk {
 /// extensions (e.g. `["mdx"]`); they are normalized (leading `.` stripped,
 /// lowercased) before matching.
 pub fn discover_files(root: &Path, config: &DiscoveryConfig) -> Result<Vec<std::path::PathBuf>> {
-    let extensions = build_extension_set(&config.extra_extensions);
-    let exclude = &config.exclude;
-    let include = &config.include;
-    let mut files = Vec::new();
-
-    let rel_of = |path: &Path| {
-        path.strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    };
-
-    for entry in WalkDir::new(root)
-        .follow_links(true)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            let rel = rel_of(e.path());
-
-            // An explicit `include` match always wins — it re-enables an
-            // otherwise-skipped directory (a default like `dist`, or hidden).
-            if include.iter().any(|s| matches_spec(s, &rel, &name)) {
-                return true;
-            }
-
-            if e.file_type().is_dir() {
-                // The walk root itself has an empty relative path; never skip it.
-                if rel.is_empty() {
-                    return true;
-                }
-                if name.starts_with('.')
-                    || DEFAULT_SKIP_DIRS.contains(&name.as_ref())
-                    || exclude.iter().any(|s| matches_spec(s, &rel, &name))
-                {
-                    return false;
-                }
-                return true;
-            }
-
-            // Files: honor excludes (extension filtering happens below).
-            !exclude.iter().any(|s| matches_spec(s, &rel, &name))
-        })
-    {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        let path = entry.path();
-        let filename = entry.file_name().to_string_lossy();
-
-        // Check by extension
-        let is_text = path
-            .extension()
-            .map(|ext| {
-                let ext_lower = ext.to_string_lossy().to_lowercase();
-                extensions.contains(&ext_lower)
-            })
-            .unwrap_or(false);
-
-        // Check by filename
-        let is_known_text = TEXT_FILENAMES.iter().any(|name| filename.as_ref() == *name);
-
-        if is_text || is_known_text {
-            files.push(path.to_path_buf());
-        }
-    }
-
-    files.sort();
-    Ok(files)
+    walk_files(
+        root,
+        &FileWalkOptions {
+            discovery: Some(config),
+            globs: &[],
+            no_ignore: false,
+            hidden: false,
+            follow_links: true,
+        },
+    )
 }
 
 /// Read a file and split it into overlapping chunks.
@@ -411,5 +469,89 @@ mod tests {
         ));
         // leading/trailing slashes are tolerated
         assert!(matches_spec("/partials/", "partials", "partials"));
+    }
+
+    #[test]
+    fn shared_discovery_applies_ignore_extension_and_source_rules() {
+        let root = std::env::temp_dir().join(format!(
+            "rag-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for dir in [".git", "dist", ".hidden"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "ignored.md\n").unwrap();
+        std::fs::write(root.join(".rgignore"), "rgignored.md\n").unwrap();
+        for name in [
+            "keep.md",
+            "ignored.md",
+            "rgignored.md",
+            "skip.md",
+            "extra.mdx",
+            "source.rs",
+            "dist/built.md",
+            ".hidden/secret.md",
+            ".secret.md",
+        ] {
+            std::fs::write(root.join(name), "cache\n").unwrap();
+        }
+        let mut config = DiscoveryConfig {
+            extra_extensions: vec!["mdx".into()],
+            exclude: vec!["skip.md".into()],
+            include: vec!["dist".into()],
+            ..Default::default()
+        };
+        let files = discover_files(&root, &config).unwrap();
+        let relative: Vec<_> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(relative.contains(&"keep.md".into()));
+        assert!(relative.contains(&"extra.mdx".into()));
+        assert!(relative.contains(&"dist/built.md".into()));
+        for excluded in [
+            "ignored.md",
+            "rgignored.md",
+            "skip.md",
+            "source.rs",
+            ".hidden/secret.md",
+            ".secret.md",
+        ] {
+            assert!(
+                !relative.contains(&excluded.to_string()),
+                "{excluded} was included"
+            );
+        }
+
+        let globbed = walk_files(
+            &root,
+            &FileWalkOptions {
+                discovery: None,
+                globs: &["ignored.md".into()],
+                no_ignore: false,
+                hidden: false,
+                follow_links: false,
+            },
+        )
+        .unwrap();
+        assert!(globbed.contains(&root.join("ignored.md")));
+
+        config.no_ignore = true;
+        config.hidden = true;
+        let expanded = discover_files(&root, &config).unwrap();
+        assert!(expanded.contains(&root.join("ignored.md")));
+        assert!(expanded.contains(&root.join("rgignored.md")));
+        assert!(expanded.contains(&root.join(".hidden/secret.md")));
+        assert!(expanded.contains(&root.join(".secret.md")));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1488,7 +1488,6 @@ dependencies = [
  "tokenizers",
  "toml",
  "ureq 2.12.1",
- "walkdir",
 ]
 
 [[package]]

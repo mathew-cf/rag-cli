@@ -4,10 +4,9 @@ use anyhow::{Context, Result};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
-use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use std::io;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug)]
 pub struct LineHit {
@@ -36,31 +35,6 @@ pub fn matcher(patterns: &[String], fixed: bool, case_insensitive: bool) -> Resu
             .build_many(patterns)
             .context("Invalid keyword regex")
     }
-}
-
-pub fn walk_files(root: &Path, globs: &[String]) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        anyhow::bail!("Search path {} does not exist", root.display());
-    }
-    let mut builder = WalkBuilder::new(root);
-    if !globs.is_empty() {
-        let mut overrides = OverrideBuilder::new(root);
-        for glob in globs {
-            overrides
-                .add(glob)
-                .with_context(|| format!("Invalid glob {glob:?}"))?;
-        }
-        builder.overrides(overrides.build()?);
-    }
-    let mut paths = Vec::new();
-    for entry in builder.build() {
-        let entry = entry.with_context(|| format!("Failed to walk {}", root.display()))?;
-        if entry.file_type().is_some_and(|kind| kind.is_file()) {
-            paths.push(entry.into_path());
-        }
-    }
-    paths.sort();
-    Ok(paths)
 }
 
 struct CollectSink<'a> {

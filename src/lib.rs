@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::config::RagConfig;
+use crate::config::{RagConfig, SearchConfig};
 use crate::embed::{
     download_model, embedding_backend, model_file_list, model_files_present, resolve_hf_cache,
     EmbeddingEngine, DEFAULT_MODEL,
@@ -20,7 +20,9 @@ use crate::embed::{
 use crate::index::{
     search_top_k, ChunkOccurrence, Index, IndexMeta, SourceRecord, TextRecord, INDEX_FORMAT_VERSION,
 };
-use crate::ingest::{chunk_file, discover_files, hash_files, DiscoveryConfig};
+use crate::ingest::{
+    chunk_file, discover_files, hash_files, walk_files, DiscoveryConfig, FileWalkOptions,
+};
 
 const DEFAULT_CHUNK_SIZE: usize = 512;
 const DEFAULT_CHUNK_OVERLAP: usize = 64;
@@ -51,9 +53,26 @@ struct SearchSettings<'a> {
     model_override: Option<&'a str>,
     group_by_source: bool,
     hybrid: bool,
+    no_hybrid: bool,
+    semantic_weight: Option<f32>,
+    keyword_weight: Option<f32>,
+    keywords: &'a [String],
     full: bool,
     json: bool,
     cache_dir: Option<&'a Path>,
+}
+
+struct KeywordSettings<'a> {
+    path: Option<&'a Path>,
+    config_path: Option<&'a Path>,
+    only: &'a [String],
+    patterns: &'a [String],
+    fixed_strings: bool,
+    ignore_case: bool,
+    globs: &'a [String],
+    no_ignore: bool,
+    hidden: bool,
+    files_with_matches: bool,
 }
 
 #[derive(Parser)]
@@ -122,6 +141,14 @@ enum Commands {
         /// repeated), e.g. `--include dist`.
         #[arg(long, value_delimiter = ',')]
         include: Vec<String>,
+
+        /// Ignore .gitignore, .ignore, and other ignore files when finding sources.
+        #[arg(long)]
+        no_ignore: bool,
+
+        /// Include hidden source directories.
+        #[arg(long)]
+        hidden: bool,
     },
 
     /// Search the index with a natural language query.
@@ -160,6 +187,25 @@ enum Commands {
         #[arg(long)]
         hybrid: bool,
 
+        /// Use semantic ranking only, overriding a hybrid default in rag.toml.
+        #[arg(long, conflicts_with_all = ["hybrid", "semantic_weight", "keyword_weight", "keywords"])]
+        no_hybrid: bool,
+
+        /// Relative weight of semantic matches in hybrid ranking (default: 1 or rag.toml).
+        /// Specifying this option enables hybrid search.
+        #[arg(long)]
+        semantic_weight: Option<f32>,
+
+        /// Relative weight of keyword matches in hybrid ranking (default: 1 or rag.toml).
+        /// Specifying this option enables hybrid search.
+        #[arg(long)]
+        keyword_weight: Option<f32>,
+
+        /// Literal keyword or phrase to match instead of extracted query terms.
+        /// Repeat for OR matching; specifying this option enables hybrid search.
+        #[arg(long = "keyword")]
+        keywords: Vec<String>,
+
         /// Show full chunk text instead of truncated preview.
         #[arg(long)]
         full: bool,
@@ -171,8 +217,18 @@ enum Commands {
 
     /// Search live files for keywords without loading an embedding model.
     Keyword {
-        /// File or directory to search recursively.
-        path: PathBuf,
+        /// File or directory to search recursively. Omit to search every source
+        /// directory in rag.toml, or the current directory if none exists.
+        #[arg(conflicts_with_all = ["config", "only"])]
+        path: Option<PathBuf>,
+
+        /// Search source directories declared by this config file.
+        #[arg(short = 'c', long, conflicts_with = "path")]
+        config: Option<PathBuf>,
+
+        /// With a config file, search only these named sources.
+        #[arg(long, value_delimiter = ',', conflicts_with = "path")]
+        only: Vec<String>,
 
         /// Patterns to match (OR; repeat -e for several patterns).
         #[arg(short = 'e', long = "regexp", required = true)]
@@ -187,8 +243,16 @@ enum Commands {
         ignore_case: bool,
 
         /// Include or exclude paths using ripgrep-style globs (repeatable).
-        #[arg(long = "glob")]
+        #[arg(short = 'g', long = "glob")]
         globs: Vec<String>,
+
+        /// Ignore .gitignore, .ignore, and other ignore files.
+        #[arg(long)]
+        no_ignore: bool,
+
+        /// Search hidden files and directories.
+        #[arg(long)]
+        hidden: bool,
 
         /// Print only matching file paths.
         #[arg(short = 'l', long = "files-with-matches")]
@@ -255,12 +319,16 @@ pub fn run() -> Result<ExitCode> {
             ext,
             exclude,
             include,
+            no_ignore,
+            hidden,
         } => match path {
             Some(path) => {
                 let discovery = DiscoveryConfig {
                     extra_extensions: ext,
                     exclude,
                     include,
+                    no_ignore,
+                    hidden,
                 };
                 cmd_index(
                     IndexSource {
@@ -290,7 +358,7 @@ pub fn run() -> Result<ExitCode> {
                 ]) {
                     eprintln!("{warning}");
                 }
-                cmd_index_from_config(config.as_deref(), &only, cache_dir)
+                cmd_index_from_config(config.as_deref(), &only, cache_dir, no_ignore, hidden)
             }
         }
         .map(|_| true),
@@ -303,6 +371,10 @@ pub fn run() -> Result<ExitCode> {
             model,
             group_by_source,
             hybrid,
+            no_hybrid,
+            semantic_weight,
+            keyword_weight,
+            keywords,
             full,
             json,
         } => cmd_search(SearchSettings {
@@ -314,6 +386,10 @@ pub fn run() -> Result<ExitCode> {
             model_override: model.as_deref(),
             group_by_source,
             hybrid,
+            no_hybrid,
+            semantic_weight,
+            keyword_weight,
+            keywords: &keywords,
             full,
             json,
             cache_dir,
@@ -321,19 +397,27 @@ pub fn run() -> Result<ExitCode> {
         .map(|_| true),
         Commands::Keyword {
             path,
+            config,
+            only,
             patterns,
             fixed_strings,
             ignore_case,
             globs,
+            no_ignore,
+            hidden,
             files_with_matches,
-        } => cmd_keyword(
-            &path,
-            &patterns,
+        } => cmd_keyword(KeywordSettings {
+            path: path.as_deref(),
+            config_path: config.as_deref(),
+            only: &only,
+            patterns: &patterns,
             fixed_strings,
             ignore_case,
-            &globs,
+            globs: &globs,
+            no_ignore,
+            hidden,
             files_with_matches,
-        ),
+        }),
         Commands::Info {
             index,
             config,
@@ -360,36 +444,111 @@ pub fn run() -> Result<ExitCode> {
     })
 }
 
-fn cmd_keyword(
-    path: &Path,
-    patterns: &[String],
-    fixed_strings: bool,
-    ignore_case: bool,
-    globs: &[String],
-    files_with_matches: bool,
-) -> Result<bool> {
+fn cmd_keyword(settings: KeywordSettings<'_>) -> Result<bool> {
+    let KeywordSettings {
+        path,
+        config_path,
+        only,
+        patterns,
+        fixed_strings,
+        ignore_case,
+        globs,
+        no_ignore,
+        hidden,
+        files_with_matches,
+    } = settings;
     let matcher = keyword::matcher(patterns, fixed_strings, ignore_case)?;
+    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+    let roots = resolve_keyword_roots_from_dir(path, config_path, only, &cwd)?;
     let mut found = false;
-    for file in keyword::walk_files(path, globs)? {
-        let hits = keyword::scan_file(&matcher, &file, files_with_matches)?;
-        if hits.is_empty() {
-            continue;
-        }
-        found = true;
-        if files_with_matches {
-            println!("{}", file.display());
-        } else {
-            for hit in hits {
-                println!(
-                    "{}:{}:{}",
-                    file.display(),
-                    hit.line_number.unwrap_or(0),
-                    hit.line
-                );
+    let mut seen = HashSet::new();
+    for root in roots {
+        for file in walk_files(
+            &root.path,
+            &FileWalkOptions {
+                discovery: root.discovery.as_ref(),
+                globs,
+                no_ignore,
+                hidden,
+                follow_links: root.discovery.is_some(),
+            },
+        )? {
+            let identity = file.canonicalize().unwrap_or_else(|_| file.clone());
+            if !seen.insert(identity) {
+                continue;
+            }
+            let hits = keyword::scan_file(&matcher, &file, files_with_matches)?;
+            if hits.is_empty() {
+                continue;
+            }
+            found = true;
+            if files_with_matches {
+                println!("{}", file.display());
+            } else {
+                for hit in hits {
+                    println!(
+                        "{}:{}:{}",
+                        file.display(),
+                        hit.line_number.unwrap_or(0),
+                        hit.line
+                    );
+                }
             }
         }
     }
     Ok(found)
+}
+
+struct KeywordRoot {
+    path: PathBuf,
+    discovery: Option<DiscoveryConfig>,
+}
+
+fn resolve_keyword_roots_from_dir(
+    path: Option<&Path>,
+    config_path: Option<&Path>,
+    only: &[String],
+    cwd: &Path,
+) -> Result<Vec<KeywordRoot>> {
+    if let Some(path) = path {
+        return Ok(vec![KeywordRoot {
+            path: path.to_path_buf(),
+            discovery: None,
+        }]);
+    }
+    let Some(config_path) = RagConfig::locate(config_path, cwd) else {
+        if !only.is_empty() {
+            anyhow::bail!("--only requires --config or a rag.toml file");
+        }
+        return Ok(vec![KeywordRoot {
+            path: cwd.to_path_buf(),
+            discovery: None,
+        }]);
+    };
+    let config = RagConfig::load(&config_path)?;
+    if let Some(missing) = only
+        .iter()
+        .find(|name| !config.indexes.iter().any(|entry| &entry.name == *name))
+    {
+        anyhow::bail!(
+            "--only names an index not in {}: {:?}",
+            config_path.display(),
+            missing
+        );
+    }
+    let base = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(config
+        .indexes
+        .iter()
+        .filter(|entry| only.is_empty() || only.iter().any(|name| name == &entry.name))
+        .map(|entry| KeywordRoot {
+            path: base.join(&entry.path),
+            discovery: Some(entry.discovery(&config)),
+        })
+        .collect())
 }
 
 fn ignored_config_options_warning(options: &[(&str, bool)]) -> Option<String> {
@@ -685,6 +844,8 @@ fn cmd_index_from_config(
     config_path: Option<&std::path::Path>,
     only: &[String],
     cache_dir: Option<&std::path::Path>,
+    no_ignore: bool,
+    hidden: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("Failed to determine current directory")?;
 
@@ -742,11 +903,9 @@ fn cmd_index_from_config(
             .or(config.chunk_overlap)
             .unwrap_or(DEFAULT_CHUNK_OVERLAP);
 
-        let discovery = DiscoveryConfig {
-            extra_extensions: entry.extensions.clone(),
-            exclude: entry.exclude.clone(),
-            include: entry.include.clone(),
-        };
+        let mut discovery = entry.discovery(&config);
+        discovery.no_ignore |= no_ignore;
+        discovery.hidden |= hidden;
 
         eprintln!();
         eprintln!(
@@ -1093,6 +1252,11 @@ struct SearchIndexSpec {
     path: PathBuf,
 }
 
+struct ResolvedSearchSources {
+    indexes: Vec<SearchIndexSpec>,
+    search: Option<SearchConfig>,
+}
+
 impl SearchIndexSpec {
     fn label(&self) -> String {
         self.name
@@ -1171,7 +1335,7 @@ struct JsonResult {
     text: String,
 }
 
-fn configured_search_indexes(config_path: &Path, only: &[String]) -> Result<Vec<SearchIndexSpec>> {
+fn configured_search_indexes(config_path: &Path, only: &[String]) -> Result<ResolvedSearchSources> {
     let base = config_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1190,7 +1354,8 @@ fn configured_search_indexes(config_path: &Path, only: &[String]) -> Result<Vec<
         );
     }
 
-    Ok(config
+    let search = config.search;
+    let indexes = config
         .indexes
         .into_iter()
         .filter(|entry| only.is_empty() || only.iter().any(|name| name == &entry.name))
@@ -1198,7 +1363,8 @@ fn configured_search_indexes(config_path: &Path, only: &[String]) -> Result<Vec<
             path: entry.output_path(&base),
             name: Some(entry.name),
         })
-        .collect())
+        .collect();
+    Ok(ResolvedSearchSources { indexes, search })
 }
 
 fn resolve_search_indexes(
@@ -1210,12 +1376,30 @@ fn resolve_search_indexes(
     resolve_search_indexes_from_dir(index_dirs, config_path, only, &cwd)
 }
 
+fn resolve_search_sources(
+    index_dirs: Vec<PathBuf>,
+    config_path: Option<&Path>,
+    only: &[String],
+) -> Result<ResolvedSearchSources> {
+    let cwd = std::env::current_dir().context("Failed to determine current directory")?;
+    resolve_search_sources_from_dir(index_dirs, config_path, only, &cwd)
+}
+
 fn resolve_search_indexes_from_dir(
     index_dirs: Vec<PathBuf>,
     config_path: Option<&Path>,
     only: &[String],
     cwd: &Path,
 ) -> Result<Vec<SearchIndexSpec>> {
+    Ok(resolve_search_sources_from_dir(index_dirs, config_path, only, cwd)?.indexes)
+}
+
+fn resolve_search_sources_from_dir(
+    index_dirs: Vec<PathBuf>,
+    config_path: Option<&Path>,
+    only: &[String],
+    cwd: &Path,
+) -> Result<ResolvedSearchSources> {
     if let Some(config_path) = config_path {
         return configured_search_indexes(config_path, only);
     }
@@ -1223,10 +1407,14 @@ fn resolve_search_indexes_from_dir(
         if !only.is_empty() {
             anyhow::bail!("--only requires a config file, but --index was provided");
         }
-        return Ok(index_dirs
+        let indexes = index_dirs
             .into_iter()
             .map(|path| SearchIndexSpec { name: None, path })
-            .collect());
+            .collect();
+        return Ok(ResolvedSearchSources {
+            indexes,
+            search: None,
+        });
     }
     if let Some(config_path) = RagConfig::locate(None, cwd) {
         return configured_search_indexes(&config_path, only);
@@ -1237,10 +1425,13 @@ fn resolve_search_indexes_from_dir(
             config::DEFAULT_CONFIG_NAMES.join("/")
         );
     }
-    Ok(vec![SearchIndexSpec {
-        name: None,
-        path: Index::default_dir(),
-    }])
+    Ok(ResolvedSearchSources {
+        indexes: vec![SearchIndexSpec {
+            name: None,
+            path: Index::default_dir(),
+        }],
+        search: None,
+    })
 }
 
 fn validate_search_metadata(
@@ -1262,7 +1453,7 @@ fn validate_search_metadata(
         }
         if meta.model_id != first.model_id {
             anyhow::bail!(
-                "Cannot federate indexes with different models: {} uses {:?}, while {} uses {:?}",
+                "Cannot federate indexes with different models: {} uses {:?}, while {} uses {:?}. Use --only to select indexes built with the same model",
                 first_spec.path.display(),
                 first.model_id,
                 spec.path.display(),
@@ -1271,7 +1462,7 @@ fn validate_search_metadata(
         }
         if meta.hidden_size != first.hidden_size {
             anyhow::bail!(
-                "Cannot federate indexes with different embedding dimensions: {} uses {}, while {} uses {}",
+                "Cannot federate indexes with different embedding dimensions: {} uses {}, while {} uses {}. Use --only to select compatible indexes",
                 first_spec.path.display(),
                 first.hidden_size,
                 spec.path.display(),
@@ -1520,6 +1711,59 @@ fn keyword_terms(query: &str) -> Vec<String> {
     }
 }
 
+fn validate_hybrid_tuning(
+    semantic_weight: f32,
+    keyword_weight: f32,
+    keywords: &[String],
+) -> Result<()> {
+    for (flag, weight) in [
+        ("--semantic-weight", semantic_weight),
+        ("--keyword-weight", keyword_weight),
+    ] {
+        if !weight.is_finite() || weight <= 0.0 {
+            anyhow::bail!("{flag} must be a finite number greater than zero");
+        }
+    }
+    if keywords.iter().any(|keyword| keyword.trim().is_empty()) {
+        anyhow::bail!("--keyword cannot be empty");
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+struct HybridTuning {
+    enabled: bool,
+    semantic_weight: f32,
+    keyword_weight: f32,
+}
+
+fn resolve_hybrid_tuning(
+    config: Option<&SearchConfig>,
+    hybrid: bool,
+    no_hybrid: bool,
+    semantic_weight: Option<f32>,
+    keyword_weight: Option<f32>,
+    keywords: &[String],
+) -> Result<HybridTuning> {
+    let cli_tuned = semantic_weight.is_some() || keyword_weight.is_some();
+    let configured_semantic = config.and_then(|search| search.semantic_weight);
+    let configured_keyword = config.and_then(|search| search.keyword_weight);
+    let semantic_weight = semantic_weight.or(configured_semantic).unwrap_or(1.0);
+    let keyword_weight = keyword_weight.or(configured_keyword).unwrap_or(1.0);
+    let configured_hybrid = config
+        .and_then(|search| search.hybrid)
+        .unwrap_or(configured_semantic.is_some() || configured_keyword.is_some());
+    let enabled = !no_hybrid && (hybrid || !keywords.is_empty() || cli_tuned || configured_hybrid);
+    if enabled {
+        validate_hybrid_tuning(semantic_weight, keyword_weight, keywords)?;
+    }
+    Ok(HybridTuning {
+        enabled,
+        semantic_weight,
+        keyword_weight,
+    })
+}
+
 fn keyword_one_index(
     spec: &SearchIndexSpec,
     index_order: usize,
@@ -1618,6 +1862,8 @@ fn fuse_hybrid(
     mut lexical: Vec<FederatedSearchResult>,
     top_k: usize,
     group_by_source: bool,
+    semantic_weight: f32,
+    keyword_weight: f32,
 ) -> Vec<FederatedSearchResult> {
     semantic.sort_by(compare_federated_results);
     lexical.sort_by(compare_federated_results);
@@ -1629,7 +1875,7 @@ fn fuse_hybrid(
             result.byte_offset,
             result.byte_len,
         );
-        result.score = 1.0 / (60 + rank + 1) as f32;
+        result.score = semantic_weight / (60 + rank + 1) as f32;
         fused.insert(key, result);
     }
     for (rank, result) in lexical.into_iter().enumerate() {
@@ -1639,7 +1885,7 @@ fn fuse_hybrid(
             result.byte_offset,
             result.byte_len,
         );
-        let contribution = 1.0 / (60 + rank + 1) as f32;
+        let contribution = keyword_weight / (60 + rank + 1) as f32;
         fused
             .entry(key)
             .and_modify(|existing| existing.score += contribution)
@@ -1661,12 +1907,26 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
         model_override,
         group_by_source,
         hybrid,
+        no_hybrid,
+        semantic_weight,
+        keyword_weight,
+        keywords,
         full,
         json,
         cache_dir,
     } = settings;
     let start = Instant::now();
-    let specs = resolve_search_indexes(index_dirs, config_path, only)?;
+    let sources = resolve_search_sources(index_dirs, config_path, only)?;
+    let tuning = resolve_hybrid_tuning(
+        sources.search.as_ref(),
+        hybrid,
+        no_hybrid,
+        semantic_weight,
+        keyword_weight,
+        keywords,
+    )?;
+    let hybrid = tuning.enabled;
+    let specs = sources.indexes;
     let metas: Vec<IndexMeta> = specs
         .iter()
         .map(|spec| {
@@ -1697,7 +1957,12 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
     let embed_time = start.elapsed();
 
     let keyword_matcher = if hybrid {
-        Some(keyword::matcher(&keyword_terms(query), true, true)?)
+        let patterns = if keywords.is_empty() {
+            keyword_terms(query)
+        } else {
+            keywords.to_vec()
+        };
+        Some(keyword::matcher(&patterns, true, true)?)
     } else {
         None
     };
@@ -1725,7 +1990,7 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
             index_order,
             &index,
             &query_embedding,
-            if hybrid {
+            if hybrid && !group_by_source {
                 top_k.saturating_mul(10)
             } else {
                 top_k
@@ -1743,7 +2008,14 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
         }
     }
     let mut results = if hybrid {
-        fuse_hybrid(candidates, keyword_candidates, top_k, group_by_source)
+        fuse_hybrid(
+            candidates,
+            keyword_candidates,
+            top_k,
+            group_by_source,
+            tuning.semantic_weight,
+            tuning.keyword_weight,
+        )
     } else {
         merge_federated_results(candidates, top_k, group_by_source)
     };
@@ -1790,8 +2062,9 @@ fn cmd_search(settings: SearchSettings<'_>) -> Result<()> {
 
                 println!();
                 println!(
-                    "  [{rank}] {source} (score: {score:.4})",
+                    "  [{rank}] {source} ({score_label}: {score:.4})",
                     rank = i + 1,
+                    score_label = if hybrid { "RRF score" } else { "score" },
                     score = result.score
                 );
                 println!("      offset: {} bytes", result.byte_offset);
@@ -1971,10 +2244,12 @@ mod tests {
         compact_records, fuse_hybrid, hydrate_results, ignored_config_options_warning,
         index_files_and_source_unchanged, keyword_one_index, merge_federated_results,
         normalized_metadata_path, relative_source_root, resolve_download_models_from_dir,
-        resolve_search_indexes_from_dir, search_one_index, unique_text_plan,
-        validate_chunk_settings, validate_search_metadata, Cli, Commands, FederatedSearchResult,
-        SearchIndexSpec, DEFAULT_MODEL,
+        resolve_hybrid_tuning, resolve_search_indexes_from_dir, resolve_search_sources_from_dir,
+        search_one_index, unique_text_plan, validate_chunk_settings, validate_hybrid_tuning,
+        validate_search_metadata, Cli, Commands, FederatedSearchResult, SearchIndexSpec,
+        DEFAULT_MODEL,
     };
+    use crate::config::SearchConfig;
     use crate::index::{
         ChunkOccurrence, Index, IndexMeta, SourceRecord, TextRecord, INDEX_FORMAT_VERSION,
     };
@@ -2126,9 +2401,69 @@ mod tests {
     fn hybrid_fusion_promotes_a_result_found_by_both_methods() {
         let semantic = vec![result(0.9, 0, 0), result(0.8, 0, 1)];
         let lexical = vec![result(3.0, 0, 1), result(2.0, 0, 2)];
-        let fused = fuse_hybrid(semantic, lexical, 3, false);
+        let fused = fuse_hybrid(semantic, lexical, 3, false, 1.0, 1.0);
         assert_eq!(fused[0].text_id, 1);
         assert!(fused[0].score > fused[1].score);
+    }
+
+    #[test]
+    fn hybrid_weights_change_which_signal_leads() {
+        let semantic = vec![result(0.9, 0, 0)];
+        let lexical = vec![result(3.0, 0, 1)];
+        let semantic_first = fuse_hybrid(semantic.clone(), lexical.clone(), 2, false, 2.0, 1.0);
+        let keyword_first = fuse_hybrid(semantic, lexical, 2, false, 1.0, 2.0);
+        assert_eq!(semantic_first[0].text_id, 0);
+        assert_eq!(keyword_first[0].text_id, 1);
+    }
+
+    #[test]
+    fn hybrid_tuning_rejects_invalid_weights_and_blank_keywords() {
+        assert!(validate_hybrid_tuning(1.0, 2.0, &["cache miss".into()]).is_ok());
+        assert!(validate_hybrid_tuning(0.0, 1.0, &[]).is_err());
+        assert!(validate_hybrid_tuning(1.0, f32::NAN, &[]).is_err());
+        assert!(validate_hybrid_tuning(1.0, f32::INFINITY, &[]).is_err());
+        assert!(validate_hybrid_tuning(1.0, 1.0, &["  ".into()]).is_err());
+    }
+
+    #[test]
+    fn cli_tuning_overrides_config_and_no_hybrid_disables_it() {
+        let config = SearchConfig {
+            hybrid: Some(true),
+            semantic_weight: Some(2.0),
+            keyword_weight: Some(3.0),
+        };
+        let inherited =
+            resolve_hybrid_tuning(Some(&config), false, false, None, None, &[]).unwrap();
+        assert!(inherited.enabled);
+        assert_eq!(
+            (inherited.semantic_weight, inherited.keyword_weight),
+            (2.0, 3.0)
+        );
+
+        let overridden =
+            resolve_hybrid_tuning(Some(&config), false, false, Some(4.0), None, &[]).unwrap();
+        assert!(overridden.enabled);
+        assert_eq!(
+            (overridden.semantic_weight, overridden.keyword_weight),
+            (4.0, 3.0)
+        );
+
+        let disabled = resolve_hybrid_tuning(Some(&config), false, true, None, None, &[]).unwrap();
+        assert!(!disabled.enabled);
+
+        let invalid_config = SearchConfig {
+            hybrid: Some(true),
+            semantic_weight: None,
+            keyword_weight: Some(0.0),
+        };
+        assert!(
+            !resolve_hybrid_tuning(Some(&invalid_config), false, true, None, None, &[])
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            resolve_hybrid_tuning(Some(&invalid_config), false, false, None, None, &[]).is_err()
+        );
     }
 
     fn result(score: f32, index_order: usize, text_id: usize) -> FederatedSearchResult {
@@ -2227,6 +2562,52 @@ mod tests {
         );
         assert!(config.is_none());
         assert!(!group_by_source, "source grouping must remain opt-in");
+    }
+
+    #[test]
+    fn search_cli_accepts_hybrid_tuning_without_the_hybrid_switch() {
+        let cli = Cli::try_parse_from([
+            "rag",
+            "search",
+            "why does caching fail",
+            "--semantic-weight",
+            "2",
+            "--keyword",
+            "cache miss",
+            "--keyword",
+            "eviction",
+        ])
+        .expect("hybrid tuning should parse without --hybrid");
+        let Commands::Search {
+            hybrid,
+            semantic_weight,
+            keywords,
+            ..
+        } = cli.command
+        else {
+            panic!("expected search command");
+        };
+        assert!(!hybrid);
+        assert_eq!(semantic_weight, Some(2.0));
+        assert_eq!(keywords, ["cache miss", "eviction"]);
+    }
+
+    #[test]
+    fn semantic_only_switch_rejects_hybrid_options() {
+        for args in [
+            ["rag", "search", "query", "--no-hybrid", "--hybrid"].as_slice(),
+            [
+                "rag",
+                "search",
+                "query",
+                "--no-hybrid",
+                "--keyword",
+                "cache",
+            ]
+            .as_slice(),
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
@@ -2406,6 +2787,26 @@ mod tests {
             .expect("search should fall back to .rag");
         std::fs::remove_dir_all(&dir).expect("temporary directory should be removed");
         assert_eq!(fallback[0].path, PathBuf::from(".rag"));
+    }
+
+    #[test]
+    fn discovered_search_config_supplies_hybrid_defaults_but_explicit_index_does_not() {
+        let dir = temp_dir("search-config-tuning");
+        std::fs::write(
+            dir.join("rag.toml"),
+            "[search]\nhybrid = true\nkeyword_weight = 2.0\n\n[[index]]\nname = 'docs'\npath = 'docs'\n",
+        )
+        .unwrap();
+        let discovered = resolve_search_sources_from_dir(vec![], None, &[], &dir).unwrap();
+        let search = discovered.search.unwrap();
+        assert_eq!(search.hybrid, Some(true));
+        assert_eq!(search.keyword_weight, Some(2.0));
+
+        let explicit =
+            resolve_search_sources_from_dir(vec![PathBuf::from("custom-index")], None, &[], &dir)
+                .unwrap();
+        assert!(explicit.search.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -11,6 +11,12 @@
 //! model = "sentence-transformers/all-MiniLM-L6-v2"
 //! chunk_size = 512
 //! chunk_overlap = 64
+//! no_ignore = false
+//! hidden = false
+//! [search]
+//! hybrid = true
+//! semantic_weight = 1.0
+//! keyword_weight = 2.0
 //!
 //! [[index]]
 //! name = "akamai"                       # output defaults to .rag/<name>
@@ -43,9 +49,23 @@ pub struct RagConfig {
     pub chunk_size: Option<usize>,
     /// Default chunk overlap for entries that don't set their own.
     pub chunk_overlap: Option<usize>,
+    /// Default file-walk behavior for all entries.
+    pub no_ignore: Option<bool>,
+    pub hidden: Option<bool>,
+    /// Defaults for `rag search`; CLI options take precedence.
+    pub search: Option<SearchConfig>,
     /// The indexes to build.
     #[serde(default, rename = "index")]
     pub indexes: Vec<IndexEntry>,
+}
+
+/// Search behavior shared by all indexes in a config file.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    pub hybrid: Option<bool>,
+    pub semantic_weight: Option<f32>,
+    pub keyword_weight: Option<f32>,
 }
 
 /// A single `[[index]]` entry.
@@ -65,6 +85,9 @@ pub struct IndexEntry {
     pub chunk_size: Option<usize>,
     /// Per-entry chunk overlap override.
     pub chunk_overlap: Option<usize>,
+    /// Per-entry file-walk overrides.
+    pub no_ignore: Option<bool>,
+    pub hidden: Option<bool>,
     /// Extra file extensions beyond the built-in allowlist.
     #[serde(default)]
     pub extensions: Vec<String>,
@@ -77,6 +100,17 @@ pub struct IndexEntry {
 }
 
 impl IndexEntry {
+    /// Build the file selection rules shared by indexing and live keyword search.
+    pub fn discovery(&self, config: &RagConfig) -> crate::ingest::DiscoveryConfig {
+        crate::ingest::DiscoveryConfig {
+            extra_extensions: self.extensions.clone(),
+            exclude: self.exclude.clone(),
+            include: self.include.clone(),
+            no_ignore: self.no_ignore.or(config.no_ignore).unwrap_or(false),
+            hidden: self.hidden.or(config.hidden).unwrap_or(false),
+        }
+    }
+
     /// Resolve this entry's index output relative to the config directory.
     pub fn output_path(&self, config_dir: &Path) -> PathBuf {
         self.output
@@ -143,6 +177,8 @@ mod tests {
             model: None,
             chunk_size: None,
             chunk_overlap: None,
+            no_ignore: None,
+            hidden: None,
             extensions: vec![],
             exclude: vec![],
             include: vec![],
@@ -167,5 +203,20 @@ mod tests {
             entry(Some(absolute.to_str().expect("test path should be UTF-8"))).output_path(base),
             absolute
         );
+    }
+
+    #[test]
+    fn search_defaults_parse_alongside_index_entries() {
+        let config: RagConfig = toml::from_str(
+            "no_ignore = true\nhidden = true\n\n[search]\nhybrid = true\nsemantic_weight = 2.0\nkeyword_weight = 0.5\n\n[[index]]\nname = 'docs'\npath = 'docs'\nno_ignore = false\n",
+        )
+        .unwrap();
+        let discovery = config.indexes[0].discovery(&config);
+        assert!(!discovery.no_ignore);
+        assert!(discovery.hidden);
+        let search = config.search.unwrap();
+        assert_eq!(search.hybrid, Some(true));
+        assert_eq!(search.semantic_weight, Some(2.0));
+        assert_eq!(search.keyword_weight, Some(0.5));
     }
 }
