@@ -512,7 +512,7 @@ mod tests {
                 path.strip_prefix(&root)
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned()
+                    .replace('\\', "/")
             })
             .collect();
         assert!(relative.contains(&"keep.md".into()));
