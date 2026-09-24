@@ -1,0 +1,21 @@
+src/index.rs
+  s_c003b022688dfb::t_8a5db01e46ba26 11,25-28,48,57,76,100-102,261-268,388,396-407
+src/ingest.rs
+  s_c003b022688dfb::t_c46e1412bebcfc 233-235,244,276,279,341-354
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "81f5726b957cf281d41156c174b53de4ec2e0d18",
+  "prompts": {},
+  "sessions": {
+    "s_c003b022688dfb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d555-d51e-7d92-b9c8-70e2b5b264c2",
+        "model": "unknown"
+      },
+      "human_author": "Mathew Jacob <mathew@cloudflare.com>"
+    }
+  }
+}
