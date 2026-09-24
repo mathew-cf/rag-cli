@@ -1,0 +1,19 @@
+tests/search_cli.rs
+  s_c003b022688dfb::t_578ecd2e891522 55-62,117,132-134,153-155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8e2c2cab0a915999c1de9f3f2ed06254dfc71694",
+  "prompts": {},
+  "sessions": {
+    "s_c003b022688dfb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d555-d51e-7d92-b9c8-70e2b5b264c2",
+        "model": "unknown"
+      },
+      "human_author": "Mathew Jacob <mathew@cloudflare.com>"
+    }
+  }
+}
