@@ -52,8 +52,14 @@ fn keyword_scans_live_files_with_rg_style_status_and_globs() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        root.join("notes/hit.md").display().to_string()
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .replace('\\', "/"),
+        root.join("notes/hit.md")
+            .display()
+            .to_string()
+            .replace('\\', "/")
     );
 
     let no_hits = Command::new(env!("CARGO_BIN_EXE_rag"))
@@ -108,7 +114,7 @@ fn keyword_searches_all_configured_sources_and_can_select_one() {
         .output()
         .unwrap();
     assert!(all.status.success());
-    let output = String::from_utf8(all.stdout).unwrap();
+    let output = String::from_utf8(all.stdout).unwrap().replace('\\', "/");
     assert!(output.contains("docs/one.md"));
     assert!(output.contains("docs/extra.mdx"));
     assert!(output.contains("docs/dist/built.md"));
@@ -123,7 +129,9 @@ fn keyword_searches_all_configured_sources_and_can_select_one() {
         .output()
         .unwrap();
     assert!(selected.status.success());
-    let output = String::from_utf8(selected.stdout).unwrap();
+    let output = String::from_utf8(selected.stdout)
+        .unwrap()
+        .replace('\\', "/");
     assert!(!output.contains("docs/one.md"));
     assert!(output.contains("reference/two.md"));
 
@@ -142,7 +150,9 @@ fn keyword_searches_all_configured_sources_and_can_select_one() {
         .output()
         .unwrap();
     assert!(expanded.status.success());
-    let output = String::from_utf8(expanded.stdout).unwrap();
+    let output = String::from_utf8(expanded.stdout)
+        .unwrap()
+        .replace('\\', "/");
     assert!(output.contains("docs/ignored.md"));
     assert!(output.contains("docs/.hidden/secret.md"));
     assert!(output.contains("docs/.secret.md"));
