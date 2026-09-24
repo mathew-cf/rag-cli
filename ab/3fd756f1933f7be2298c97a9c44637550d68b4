@@ -1,0 +1,19 @@
+src/ingest.rs
+  s_c003b022688dfb::t_7f90be740f174f 515
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ab3fd756f1933f7be2298c97a9c44637550d68b4",
+  "prompts": {},
+  "sessions": {
+    "s_c003b022688dfb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0d555-d51e-7d92-b9c8-70e2b5b264c2",
+        "model": "unknown"
+      },
+      "human_author": "Mathew Jacob <mathew@cloudflare.com>"
+    }
+  }
+}
