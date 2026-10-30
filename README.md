@@ -119,6 +119,27 @@ path = "reference/md"
 
 With this config in the current directory:
 
+Use `paths` instead of `path` to combine several directories into one physical
+index. Existing single-directory `path` entries retain their behavior:
+
+```toml
+[[index]]
+name = "combined-docs"
+paths = ["service-a/docs", "service-b/.cloudflare/docs"]
+hidden = true
+```
+
+Specify exactly one of `path` or a nonempty `paths` list. Paths resolve relative
+to the config file and must be existing directories. Multi-directory sources use
+their canonical common ancestor as the source root, with result paths relative
+to it. Duplicate or overlapping directories do not duplicate files. Only selected
+trees participate in indexing and live keyword search; new sibling directories
+stay excluded even with `include`, `--glob`, or `--no-ignore` overrides. Existing
+ignore files, exclusions, and skipped directories still apply; `hidden = true`
+allows traversal through hidden ancestors. Path-prefix exclusions are relative
+to the common root; bare-name exclusions match as before. A change to the common
+root triggers a full rebuild.
+
 | Command | Default scope | One-off selection |
 |---------|---------------|-------------------|
 | `rag index` | Build every `[[index]]` | `--only docs` |

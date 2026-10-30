@@ -327,6 +327,7 @@ pub fn run() -> Result<ExitCode> {
                     extra_extensions: ext,
                     exclude,
                     include,
+                    include_paths: Vec::new(),
                     no_ignore,
                     hidden,
                 };
@@ -540,15 +541,18 @@ fn resolve_keyword_roots_from_dir(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    Ok(config
+    config
         .indexes
         .iter()
         .filter(|entry| only.is_empty() || only.iter().any(|name| name == &entry.name))
-        .map(|entry| KeywordRoot {
-            path: base.join(&entry.path),
-            discovery: Some(entry.discovery(&config)),
+        .map(|entry| {
+            let source = entry.resolve_source(&config, base)?;
+            Ok(KeywordRoot {
+                path: source.root,
+                discovery: Some(source.discovery),
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn ignored_config_options_warning(options: &[(&str, bool)]) -> Option<String> {
@@ -890,7 +894,7 @@ fn cmd_index_from_config(
 
     let total = selected.len();
     for (i, entry) in selected.iter().enumerate() {
-        let index_path = base.join(&entry.path);
+        let source = entry.resolve_source(&config, &base)?;
         let output = entry.output_path(&base);
 
         let model = entry.model_id(&config, DEFAULT_MODEL);
@@ -903,7 +907,7 @@ fn cmd_index_from_config(
             .or(config.chunk_overlap)
             .unwrap_or(DEFAULT_CHUNK_OVERLAP);
 
-        let mut discovery = entry.discovery(&config);
+        let mut discovery = source.discovery;
         discovery.no_ignore |= no_ignore;
         discovery.hidden |= hidden;
 
@@ -918,8 +922,8 @@ fn cmd_index_from_config(
 
         cmd_index(
             IndexSource {
-                path: &index_path,
-                metadata_root: &entry.path,
+                path: &source.root,
+                metadata_root: &source.metadata_root,
             },
             Some(&output),
             &model,

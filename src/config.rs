@@ -75,7 +75,9 @@ pub struct IndexEntry {
     /// Logical name; also the default output dir (`.rag/<name>`).
     pub name: String,
     /// Directory to index, resolved relative to the config file's directory.
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
+    /// Multiple directories sharing one index, resolved relative to the config.
+    pub paths: Option<Vec<PathBuf>>,
     /// Output index directory. Defaults to `.rag/<name>` (relative to the
     /// config file's directory).
     pub output: Option<PathBuf>,
@@ -99,6 +101,12 @@ pub struct IndexEntry {
     pub include: Vec<String>,
 }
 
+pub struct ResolvedSource {
+    pub root: PathBuf,
+    pub metadata_root: PathBuf,
+    pub discovery: crate::ingest::DiscoveryConfig,
+}
+
 impl IndexEntry {
     /// Build the file selection rules shared by indexing and live keyword search.
     pub fn discovery(&self, config: &RagConfig) -> crate::ingest::DiscoveryConfig {
@@ -106,8 +114,55 @@ impl IndexEntry {
             extra_extensions: self.extensions.clone(),
             exclude: self.exclude.clone(),
             include: self.include.clone(),
+            include_paths: Vec::new(),
             no_ignore: self.no_ignore.or(config.no_ignore).unwrap_or(false),
             hidden: self.hidden.or(config.hidden).unwrap_or(false),
+        }
+    }
+
+    /// Preserve legacy single-path metadata; multi-path sources use one canonical
+    /// common root with a strict directory selection beneath it.
+    pub fn resolve_source(&self, config: &RagConfig, base: &Path) -> Result<ResolvedSource> {
+        let mut discovery = self.discovery(config);
+        match (&self.path, &self.paths) {
+            (Some(path), None) => Ok(ResolvedSource {
+                root: base.join(path),
+                metadata_root: path.clone(),
+                discovery,
+            }),
+            (None, Some(paths)) if !paths.is_empty() => {
+                let mut directories = Vec::new();
+                for path in paths {
+                    let resolved = base.join(path).canonicalize().with_context(|| {
+                        format!("Directory not found: {}", base.join(path).display())
+                    })?;
+                    if !resolved.is_dir() {
+                        bail!("Source is not a directory: {}", resolved.display());
+                    }
+                    directories.push(resolved);
+                }
+                directories.sort();
+                directories.dedup();
+                let mut root = directories[0].clone();
+                while !directories.iter().all(|path| path.starts_with(&root)) {
+                    if !root.pop() {
+                        bail!("Sources do not share a filesystem root");
+                    }
+                }
+                discovery.include_paths = directories
+                    .iter()
+                    .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+                    .collect();
+                Ok(ResolvedSource {
+                    metadata_root: root.clone(),
+                    root,
+                    discovery,
+                })
+            }
+            _ => bail!(
+                "Index {:?} requires exactly one of path or nonempty paths",
+                self.name
+            ),
         }
     }
 
@@ -145,6 +200,14 @@ impl RagConfig {
         // Reject duplicate names — they'd otherwise clobber each other's default
         // output directory (.rag/<name>).
         for (i, entry) in config.indexes.iter().enumerate() {
+            if !matches!((&entry.path, &entry.paths), (Some(_), None))
+                && !matches!((&entry.path, &entry.paths), (None, Some(paths)) if !paths.is_empty())
+            {
+                bail!(
+                    "Index {:?} requires exactly one of path or nonempty paths",
+                    entry.name
+                );
+            }
             if let Some(dup) = config.indexes[..i].iter().find(|e| e.name == entry.name) {
                 bail!("Duplicate index name in {}: {:?}", path.display(), dup.name);
             }
@@ -172,7 +235,8 @@ mod tests {
     fn entry(output: Option<&str>) -> IndexEntry {
         IndexEntry {
             name: "docs".into(),
-            path: "sources/docs".into(),
+            path: Some("sources/docs".into()),
+            paths: None,
             output: output.map(PathBuf::from),
             model: None,
             chunk_size: None,
@@ -183,6 +247,32 @@ mod tests {
             exclude: vec![],
             include: vec![],
         }
+    }
+
+    #[test]
+    fn paths_resolves_common_root_and_preserves_legacy_metadata() {
+        let root = std::env::temp_dir().join(format!("rag-config-paths-{}", std::process::id()));
+        for dir in ["a/docs", "b/docs"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let config: RagConfig =
+            toml::from_str("[[index]]\nname='docs'\npaths=['a/docs','b/docs','a/docs']\n").unwrap();
+        let source = config.indexes[0].resolve_source(&config, &root).unwrap();
+        assert_eq!(source.root, root.canonicalize().unwrap());
+        assert_eq!(
+            source.discovery.include_paths,
+            vec![PathBuf::from("a/docs"), PathBuf::from("b/docs")]
+        );
+        let config: RagConfig = toml::from_str("[[index]]\nname='docs'\npath='a/docs'\n").unwrap();
+        let source = config.indexes[0].resolve_source(&config, &root).unwrap();
+        assert_eq!(source.metadata_root, PathBuf::from("a/docs"));
+        assert!(source.discovery.include_paths.is_empty());
+        let config: RagConfig =
+            toml::from_str("[[index]]\nname='docs'\npaths=['a/docs']\n").unwrap();
+        let source = config.indexes[0].resolve_source(&config, &root).unwrap();
+        assert_eq!(source.root, root.join("a/docs").canonicalize().unwrap());
+        assert_eq!(source.discovery.include_paths, vec![PathBuf::new()]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

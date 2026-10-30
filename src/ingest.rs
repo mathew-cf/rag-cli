@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Text file extensions we'll index.
 ///
@@ -106,6 +106,9 @@ pub struct DiscoveryConfig {
     /// Specs matching normally-skipped directories (defaults or hidden) that
     /// should be indexed anyway.
     pub include: Vec<String>,
+    /// Optional directory allowlist relative to the source root. This restricts
+    /// the corpus without overriding ignore, exclude, or default skip rules.
+    pub include_paths: Vec<PathBuf>,
     /// Search files ignored by .gitignore, .ignore, .rgignore, git excludes, and global ignores.
     pub no_ignore: bool,
     /// Include hidden directories as well as ordinary directories.
@@ -149,6 +152,14 @@ fn discovery_entry_allowed(
     if rel.is_empty() {
         return true;
     }
+    let relative = Path::new(&rel);
+    if !config.include_paths.is_empty()
+        && !config.include_paths.iter().any(|selected| {
+            relative.starts_with(selected) || (is_dir && selected.starts_with(relative))
+        })
+    {
+        return false;
+    }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     if config
         .include
@@ -183,7 +194,27 @@ pub fn walk_files(root: &Path, options: &FileWalkOptions<'_>) -> Result<Vec<Path
     if !root.exists() {
         anyhow::bail!("Search path {} does not exist", root.display());
     }
-    let discovery = options.discovery.cloned();
+    let mut discovery = options.discovery.cloned();
+    let mut selected_directories = Vec::new();
+    if let Some(config) = &mut discovery {
+        config.include_paths = normalize_include_paths(&config.include_paths)?;
+        if !config.include_paths.is_empty() {
+            let canonical_root = root.canonicalize()?;
+            for selected in &config.include_paths {
+                let path = root.join(selected);
+                let canonical = path
+                    .canonicalize()
+                    .with_context(|| format!("Selected directory not found: {}", path.display()))?;
+                if !canonical.is_dir() || !canonical.starts_with(&canonical_root) {
+                    anyhow::bail!(
+                        "Selected directory must stay inside the source root: {}",
+                        path.display()
+                    );
+                }
+                selected_directories.push(canonical);
+            }
+        }
+    }
     let no_ignore = options.no_ignore || discovery.as_ref().is_some_and(|config| config.no_ignore);
     let hidden = options.hidden || discovery.as_ref().is_some_and(|config| config.hidden);
     let mut builder = WalkBuilder::new(root);
@@ -211,13 +242,14 @@ pub fn walk_files(root: &Path, options: &FileWalkOptions<'_>) -> Result<Vec<Path
         let config = config.clone();
         let root = root.to_path_buf();
         builder.filter_entry(move |entry| {
-            discovery_entry_allowed(
-                &root,
-                entry.path(),
-                entry.file_type().is_some_and(|kind| kind.is_dir()),
-                &config,
-                hidden,
-            )
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            discovery_entry_allowed(&root, entry.path(), is_dir, &config, hidden)
+                && (selected_directories.is_empty()
+                    || entry.path().canonicalize().is_ok_and(|path| {
+                        selected_directories.iter().any(|selected| {
+                            path.starts_with(selected) || (is_dir && selected.starts_with(&path))
+                        })
+                    }))
         });
     }
     let extensions = discovery
@@ -236,6 +268,26 @@ pub fn walk_files(root: &Path, options: &FileWalkOptions<'_>) -> Result<Vec<Path
     }
     files.sort();
     Ok(files)
+}
+
+pub(crate) fn normalize_include_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    paths
+        .iter()
+        .map(|path| {
+            let mut normalized = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    Component::Normal(part) => normalized.push(part),
+                    Component::CurDir => {}
+                    _ => anyhow::bail!(
+                        "include_paths entries must be relative directories without '..': {}",
+                        path.display()
+                    ),
+                }
+            }
+            Ok(normalized)
+        })
+        .collect()
 }
 
 /// Chunk of text with metadata about where it came from.
